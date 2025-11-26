@@ -70,7 +70,7 @@ const initialState: GameState = {
 
 interface CardProps {
   card: CardInstance | BoardCard;
-  onClick?: () => void;
+  onClick?: (e: React.MouseEvent) => void;
   location: 'hand' | 'board' | 'discard' | 'deck' | 'chain' | 'opponent';
   isHovered?: boolean;
   onHover?: (c: CardInstance | null) => void;
@@ -79,6 +79,7 @@ interface CardProps {
   isDragging?: boolean;
   isResolving?: boolean;
   isValidDropTarget?: boolean;
+  isSelected?: boolean;
 }
 
 const Card: React.FC<CardProps> = ({ 
@@ -91,7 +92,8 @@ const Card: React.FC<CardProps> = ({
   onDrop,
   isDragging,
   isResolving,
-  isValidDropTarget
+  isValidDropTarget,
+  isSelected
 }) => {
   const getTypeStyles = (type: string) => {
     switch (type) {
@@ -107,7 +109,7 @@ const Card: React.FC<CardProps> = ({
   const isBoard = location === 'board' || location === 'opponent';
   const attachments = isBoard ? (card as BoardCard).attachments || [] : [];
   
-  const sizeClasses = isBoard ? 'w-40 h-56' : (location === 'chain' && isResolving) ? 'w-56 h-80' : 'w-32 h-48'; 
+  const sizeClasses = isBoard ? 'w-28 h-40 md:w-40 md:h-56' : (location === 'chain' && isResolving) ? 'w-40 h-56 md:w-56 md:h-80' : 'w-24 h-36 md:w-32 md:h-48'; 
   
   const handleDragOver = (e: React.DragEvent) => {
     if (onDrop) {
@@ -136,46 +138,47 @@ const Card: React.FC<CardProps> = ({
         relative select-none cursor-pointer flex-none
         ${sizeClasses}
         ${getTypeStyles(card.type)}
-        border-2 rounded-xl flex flex-col p-3 shadow-xl overflow-hidden
-        ${isHovered ? 'z-40 ring-4 ring-yellow-400 shadow-yellow-500/50' : 'z-10'}
+        border-2 rounded-xl flex flex-col p-2 md:p-3 shadow-xl overflow-hidden
+        ${isSelected ? 'ring-4 ring-yellow-400 shadow-[0_0_20px_rgba(250,204,21,0.6)] -translate-y-4 z-50' : ''}
+        ${isHovered && !isSelected ? 'z-40 ring-2 ring-yellow-400 shadow-yellow-500/50' : 'z-10'}
         ${isDragging ? 'opacity-40 grayscale border-dashed' : ''}
         ${isResolving ? 'ring-4 ring-white z-50 shadow-[0_0_50px_rgba(255,255,255,0.8)] scale-110 rotate-0' : ''}
         ${isValidDropTarget ? 'ring-4 ring-green-400 shadow-[0_0_20px_rgba(74,222,128,0.5)]' : ''}
-        transition-all duration-500 ease-out
+        transition-all duration-300 ease-out
       `}
     >
-      <div className="text-sm font-bold leading-tight border-b border-white/20 pb-2 mb-2 min-h-[3em] flex items-center">
+      <div className="text-[10px] md:text-sm font-bold leading-tight border-b border-white/20 pb-1 md:pb-2 mb-1 md:mb-2 min-h-[2.5em] md:min-h-[3em] flex items-center">
         {card.name}
       </div>
       
       <div className="flex-1 flex flex-col items-center relative">
-        <div className="text-[10px] opacity-70 uppercase tracking-wider mb-1">{card.type}</div>
+        <div className="text-[8px] md:text-[10px] opacity-70 uppercase tracking-wider mb-1">{card.type}</div>
         
         {card.classValue && (
           <div className="flex flex-col items-center mb-1">
-            <span className="text-4xl text-yellow-500 drop-shadow-lg">★</span>
-            <span className="font-bold text-lg">{card.classValue}</span>
+            <span className="text-2xl md:text-4xl text-yellow-500 drop-shadow-lg">★</span>
+            <span className="font-bold text-sm md:text-lg">{card.classValue}</span>
           </div>
         )}
         
         {card.subType === 'Supernova' && (
           <div className="absolute inset-0 flex items-center justify-center opacity-30">
-            <div className="w-20 h-20 bg-yellow-500 rounded-full blur-xl"></div>
+            <div className="w-12 h-12 md:w-20 md:h-20 bg-yellow-500 rounded-full blur-xl"></div>
           </div>
         )}
 
-        <div className="mt-auto w-full bg-black/30 p-1.5 rounded text-[10px] text-center leading-snug">
+        <div className="mt-auto w-full bg-black/30 p-1 rounded text-[8px] md:text-[10px] text-center leading-snug hidden md:block">
           {card.effectText}
         </div>
       </div>
 
       {isBoard && attachments.length > 0 && (
-        <div className="absolute -bottom-3 -right-2 flex space-x-[-12px] pb-1 pr-1 pointer-events-none">
+        <div className="absolute -bottom-2 -right-2 flex space-x-[-8px] md:space-x-[-12px] pb-1 pr-1 pointer-events-none">
           {attachments.map((att, idx) => (
             <div 
               key={idx + att.id}
               className={`
-                w-10 h-10 rounded-full border-2 border-white shadow-md flex items-center justify-center text-[12px] z-10 
+                w-6 h-6 md:w-10 md:h-10 rounded-full border-2 border-white shadow-md flex items-center justify-center text-[8px] md:text-[12px] z-10 
                 ${att.name === "Solar Eclipse" ? "bg-indigo-600 text-white shadow-[0_0_10px_indigo]" : "bg-green-700 text-white"}
                 ${att.name === "Rocky Planet" ? "bg-amber-700" : ""}
                 ${att.name === "Gas Giant" ? "bg-purple-700" : ""}
@@ -200,10 +203,12 @@ export default function App() {
   // UI States
   const [hoveredCard, setHoveredCard] = useState<CardInstance | null>(null);
   const [draggedCard, setDraggedCard] = useState<CardInstance | null>(null);
+  const [selectedClickCard, setSelectedClickCard] = useState<CardInstance | null>(null); // For Click-to-Play
   const [dragOverBoard, setDragOverBoard] = useState(false);
   const [dragOverDeck, setDragOverDeck] = useState(false);
   const [dragOverDiscard, setDragOverDiscard] = useState(false);
   const [showVoidPreview, setShowVoidPreview] = useState(false);
+  const [showMobileInfo, setShowMobileInfo] = useState(false);
   
   // Network States
   const [username, setUsername] = useState("Commander");
@@ -276,11 +281,11 @@ export default function App() {
           peerRef.current = peer;
           peer.on('open', (id: string) => {
               setHostId(id);
-              setConnectionStatus(host ? "Waiting for Opponent..." : "Ready to Join");
+              setConnectionStatus(host ? "Waiting..." : "Ready");
           });
           if (host) {
               peer.on('connection', (conn: any) => {
-                  setConnectionStatus("Connected!");
+                  setConnectionStatus("Connected");
                   connRef.current = conn;
                   setupConnection(conn);
                   startGame(true);
@@ -295,7 +300,7 @@ export default function App() {
       const conn = peerRef.current.connect(joinId);
       connRef.current = conn;
       conn.on('open', () => {
-          setConnectionStatus("Connected!");
+          setConnectionStatus("Connected");
           setupConnection(conn);
           startGame(false);
       });
@@ -348,7 +353,7 @@ export default function App() {
       }));
   };
 
-  // --- Game Loop Hooks (Chain) ---
+  // --- Game Loop Hooks ---
   useEffect(() => {
     if (game.isResolving && game.chainStack.length > 0) {
       const topCard = game.chainStack[game.chainStack.length - 1];
@@ -544,22 +549,18 @@ export default function App() {
     });
   };
 
-  // --- Handlers & Logic ---
+  // --- Handlers ---
 
   const nextPhaseOrTurn = () => {
     setGame(prev => {
-      // Chain Resolution
       if (prev.pendingChain && prev.chainStack.length > 0) {
          return { ...prev, pendingChain: false, isResolving: true, logs: [...prev.logs, "Resolving Chain..."] };
       }
-
-      // Turn Passing
       if (prev.phase === Phase.Action) {
         const activeHand = prev.players[prev.activePlayerId].hand;
         if (activeHand.length > 5) {
           return { ...prev, selectionMode: 'DISCARD_TO_FIVE', logs: [...prev.logs, "Hand limit! Discard to 5."] };
         }
-        
         const nextPlayerId = prev.activePlayerId === 1 ? 2 : 1;
         const nextPlayer = prev.players[nextPlayerId];
         const nextHand = [...nextPlayer.hand];
@@ -609,106 +610,117 @@ export default function App() {
            logs: [...prev.logs, `Discarded ${card.name}.`]
         };
      });
+     setSelectedClickCard(null);
   };
 
-  // --- Drag & Drop ---
-  const handleDragStart = (e: React.DragEvent, card: CardInstance) => {
-    if (game.phase === Phase.Setup) return;
-    if (game.phase === Phase.Action && card.type === CardType.Star && game.forbiddenStarClass === card.classValue) return;
-    if (game.phase === Phase.Action && getActivePlayer().hand.length <= 5 && game.selectionMode !== 'DISCARD_TO_FIVE') return;
-    if (game.isResolving || game.pendingDecision) { e.preventDefault(); return; }
+  // --- Unified Drag & Click Logic ---
+  
+  // 1. Select Card (Drag Start or Click in Hand)
+  const handleHandCardInteraction = (card: CardInstance) => {
+      if (game.phase === Phase.Setup) return;
+      if (game.phase === Phase.Action && card.type === CardType.Star && game.forbiddenStarClass === card.classValue) return;
+      if (game.phase === Phase.Action && getActivePlayer().hand.length <= 5 && game.selectionMode !== 'DISCARD_TO_FIVE') return;
+      if (game.isResolving || game.pendingDecision) return;
 
-    setDraggedCard(card);
-    e.dataTransfer.setData('text/plain', card.id);
-  };
-
-  const handleDragOverBoard = (e: React.DragEvent) => { e.preventDefault(); setDragOverBoard(true); };
-  const handleDragOverDeck = (e: React.DragEvent) => { e.preventDefault(); setDragOverDeck(true); };
-  const handleDragOverDiscard = (e: React.DragEvent) => { e.preventDefault(); setDragOverDiscard(true); };
-
-  const handleDropOnDiscard = (e: React.DragEvent) => {
-      e.preventDefault(); setDragOverDiscard(false);
-      if (draggedCard && (game.selectionMode === 'DISCARD_TO_FIVE' || getActivePlayer().hand.length > 5)) {
-          handleDiscard(draggedCard);
+      // If in discard mode, clicking instantly discards
+      if (game.selectionMode === 'DISCARD_TO_FIVE') {
+          handleDiscard(card);
+          return;
       }
-      setDraggedCard(null);
+
+      // Toggle selection for Click-to-Play
+      if (selectedClickCard?.id === card.id) {
+          setSelectedClickCard(null);
+      } else {
+          setSelectedClickCard(card);
+      }
   };
 
-  const handleDropOnBoard = (e: React.DragEvent) => {
-    e.preventDefault(); setDragOverBoard(false);
-    if (!draggedCard || game.phase === Phase.Setup) return;
-    if (game.phase === Phase.Action && getActivePlayer().hand.length <= 5 && game.selectionMode !== 'DISCARD_TO_FIVE') return;
+  const handleDragStart = (e: React.DragEvent, card: CardInstance) => {
+      // Drag is just a visual representation of selection in this unified model
+      handleHandCardInteraction(card);
+      if (game.phase === Phase.Action && getActivePlayer().hand.length <= 5 && game.selectionMode !== 'DISCARD_TO_FIVE') {
+          e.preventDefault(); 
+          return;
+      }
+      setDraggedCard(card);
+      e.dataTransfer.setData('text/plain', card.id);
+  };
 
-    if (draggedCard.type === CardType.Star) {
-         if (game.forbiddenStarClass && draggedCard.classValue === game.forbiddenStarClass) {
-             setGame(prev => ({ ...prev, logs: [...prev.logs, "Forbidden Class!"] }));
-             setDraggedCard(null); return;
-         }
+  // 2. Execute Play (Drop or Click on Target)
+  const executePlayOnBoard = (card: CardInstance | null) => {
+      const active = card || draggedCard || selectedClickCard;
+      if (!active) return;
+
+      if (active.type === CardType.Star) {
          const player = getActivePlayer();
          const compatible = player.hand.filter(c => c.type === CardType.Discovery);
-         const required = draggedCard.classValue || 99;
+         const required = active.classValue || 99;
          
          if (compatible.length >= required && required > 0) {
             setGame(prev => ({
                ...prev,
-               pendingDecision: { type: 'OFFER_COMPLETE_SYSTEM', cardId: draggedCard.id, compatibleDiscoveries: compatible.slice(0, required).map(d => d.id) }
+               pendingDecision: { type: 'OFFER_COMPLETE_SYSTEM', cardId: active.id, compatibleDiscoveries: compatible.slice(0, required).map(d => d.id) }
             }));
          } else {
-            playCard(draggedCard);
+            playCard(active);
          }
-    } else if ([CardType.Flare, CardType.Fracture, CardType.Omen].includes(draggedCard.type)) {
+      } else if ([CardType.Flare, CardType.Fracture, CardType.Omen].includes(active.type)) {
          const needsTarget = ["Athena", "Ignition", "Solar Eclipse", "Planet of Life"];
-         if (needsTarget.includes(draggedCard.name)) {
-             setGame(prev => ({ ...prev, logs: [...prev.logs, `${draggedCard.name} requires a specific target (Star or Discovery).`] }));
-         } else if (draggedCard.name === "Dark Matter Void") {
+         if (needsTarget.includes(active.name)) {
+             setGame(prev => ({ ...prev, logs: [...prev.logs, `${active.name} requires a specific target (Star or Discovery).`] }));
+         } else if (active.name === "Dark Matter Void") {
              setGame(prev => ({ 
                   ...prev, 
-                  pendingDecision: { type: 'SELECT_VOID_CLASS', cardId: draggedCard.id }
+                  pendingDecision: { type: 'SELECT_VOID_CLASS', cardId: active.id }
               }));
          } else {
-             playCard(draggedCard);
+             playCard(active);
          }
-    }
-    setDraggedCard(null);
+      }
+      
+      setDraggedCard(null);
+      setSelectedClickCard(null);
   };
 
-  const handleDropOnStar = (e: React.DragEvent, targetStar: BoardCard) => {
-    e.stopPropagation(); setDragOverBoard(false);
-    if (!draggedCard) return;
+  const executePlayOnStar = (targetStar: BoardCard, card: CardInstance | null) => {
+      const active = card || draggedCard || selectedClickCard;
+      if (!active) return;
 
-    if (targetStar.ownerId === game.activePlayerId) {
-        if (draggedCard.type === CardType.Discovery) {
+      if (targetStar.ownerId === game.activePlayerId) {
+        if (active.type === CardType.Discovery) {
            const discCount = targetStar.attachments.filter(a => a.type === CardType.Discovery).length;
            if (targetStar.classValue && discCount >= targetStar.classValue) {
                setGame(prev => ({ ...prev, logs: [...prev.logs, "System Full."] }));
            } else {
-               playCard(draggedCard, targetStar.id);
+               playCard(active, targetStar.id);
            }
-        } else if (draggedCard.name === "Solar Eclipse") {
+        } else if (active.name === "Solar Eclipse") {
             const discCount = targetStar.attachments.filter(a => a.type === CardType.Discovery).length;
             if (targetStar.classValue && discCount >= targetStar.classValue) {
-                playCard(draggedCard, targetStar.id);
+                playCard(active, targetStar.id);
             }
-        } else if (draggedCard.name === "Planet of Life") {
+        } else if (active.name === "Planet of Life") {
             if (targetStar.attachments.some(a => a.name === "Rocky Planet")) {
-                playCard(draggedCard, targetStar.id);
+                playCard(active, targetStar.id);
             }
         }
-    } else {
-        if (draggedCard.name === "Athena") {
+      } else {
+        if (active.name === "Athena") {
              const discs = targetStar.attachments.filter(a => a.type === CardType.Discovery);
              if (discs.length > 1) {
-                 setGame(prev => ({ ...prev, pendingDecision: { type: 'SELECT_DESTRUCTION_TARGET', cardId: draggedCard.id, targetId: targetStar.id, candidates: discs } }));
+                 setGame(prev => ({ ...prev, pendingDecision: { type: 'SELECT_DESTRUCTION_TARGET', cardId: active.id, targetId: targetStar.id, candidates: discs } }));
              } else if (discs.length === 1) {
-                 playCard(draggedCard, discs[0].id);
+                 playCard(active, discs[0].id);
              }
-        } else if (draggedCard.name === "Ignition") {
+        } else if (active.name === "Ignition") {
              if (targetStar.attachments.some(a => a.name === "Gas Giant")) {
-                 playCard(draggedCard, targetStar.id);
+                 playCard(active, targetStar.id);
              }
         }
-    }
-    setDraggedCard(null);
+      }
+      setDraggedCard(null);
+      setSelectedClickCard(null);
   };
 
   const playCard = (card: CardInstance, targetId?: string) => {
@@ -739,7 +751,6 @@ export default function App() {
             logs: [...prev.logs, `Attached ${card.name}.`]
           };
        }
-       // Default chain play
        return {
           ...prev,
           players: { ...prev.players, [card.ownerId]: { ...player, hand: newHand } },
@@ -751,7 +762,7 @@ export default function App() {
     });
   };
 
-  // --- Decision Handlers ---
+  // ... (Decision Handlers same as previous) ...
   const handleCompleteSystem = (exec: boolean) => {
       if(!game.pendingDecision) return;
       const { cardId, compatibleDiscoveries } = game.pendingDecision;
@@ -806,9 +817,7 @@ export default function App() {
       const cardId = game.pendingDecision.cardId;
       const player = game.players[game.activePlayerId];
       const card = player.hand.find(c => c.id === cardId);
-      if(card) {
-          playCard(card, targetId);
-      }
+      if(card) playCard(card, targetId);
       setGame(prev => ({ ...prev, pendingDecision: null }));
   };
 
@@ -828,51 +837,27 @@ export default function App() {
 
   if (game.phase === Phase.Setup) {
       return (
-          <div className="w-full h-screen bg-gray-900 text-white flex flex-col items-center justify-center relative">
+          <div className="w-full h-screen bg-gray-900 text-white flex flex-col items-center justify-center relative p-4">
               <div className="absolute inset-0 opacity-30 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')]"></div>
-              <div className="z-10 bg-gray-800 p-10 rounded-2xl shadow-2xl border-2 border-yellow-500 max-w-md w-full">
-                  <h1 className="text-4xl font-bold text-yellow-500 mb-2 text-center tracking-wider">NOVACANA</h1>
-                  <div className="text-gray-400 text-center mb-8 text-sm">Galactic Strategy Card Game</div>
-                  
+              <div className="z-10 bg-gray-800 p-6 md:p-10 rounded-2xl shadow-2xl border-2 border-yellow-500 max-w-md w-full">
+                  <h1 className="text-3xl md:text-4xl font-bold text-yellow-500 mb-2 text-center tracking-wider">NOVACANA</h1>
+                  <div className="text-gray-400 text-center mb-8 text-xs md:text-sm">Galactic Strategy Card Game</div>
                   <div className="mb-6">
                       <label className="block text-xs font-bold text-gray-500 mb-1">CALL SIGN</label>
-                      <input 
-                        type="text" 
-                        value={username} 
-                        onChange={(e) => setUsername(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 rounded p-3 text-white focus:border-yellow-500 outline-none"
-                      />
+                      <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} className="w-full bg-gray-900 border border-gray-700 rounded p-3 text-white focus:border-yellow-500 outline-none"/>
                   </div>
-
                   <div className="space-y-3">
-                      <button onClick={startLocalGame} className="w-full py-4 bg-yellow-600 hover:bg-yellow-500 text-black font-bold rounded shadow-lg transition">
-                          PLAY LOCAL (PASS & PLAY)
-                      </button>
+                      <button onClick={startLocalGame} className="w-full py-4 bg-yellow-600 hover:bg-yellow-500 text-black font-bold rounded shadow-lg transition">PLAY LOCAL (PASS & PLAY)</button>
                       <div className="h-px bg-gray-700 my-4"></div>
-                      <button onClick={() => initNetwork(true)} className="w-full py-3 bg-indigo-700 hover:bg-indigo-600 rounded font-bold transition">
-                          HOST NETWORK GAME
-                      </button>
+                      <button onClick={() => initNetwork(true)} className="w-full py-3 bg-indigo-700 hover:bg-indigo-600 rounded font-bold transition">HOST NETWORK GAME</button>
                       <div className="flex space-x-2">
-                          <input 
-                            type="text" 
-                            placeholder="Enter Host ID" 
-                            value={joinId}
-                            onChange={(e) => setJoinId(e.target.value)}
-                            className="flex-1 bg-gray-900 border border-gray-700 rounded p-3 text-sm"
-                          />
-                          <button onClick={joinGame} className="px-6 bg-indigo-900 hover:bg-indigo-800 border border-indigo-600 rounded font-bold transition">
-                              JOIN
-                          </button>
+                          <input type="text" placeholder="Enter Host ID" value={joinId} onChange={(e) => setJoinId(e.target.value)} className="flex-1 bg-gray-900 border border-gray-700 rounded p-3 text-sm"/>
+                          <button onClick={joinGame} className="px-6 bg-indigo-900 hover:bg-indigo-800 border border-indigo-600 rounded font-bold transition">JOIN</button>
                       </div>
                       {isMultiplayer && (
                           <div className="mt-4 p-3 bg-black/50 rounded text-center">
-                              <div className="text-xs text-gray-500 mb-1">CONNECTION STATUS</div>
-                              <div className="font-mono text-green-400">{connectionStatus}</div>
-                              {isHost && hostId && (
-                                  <div className="mt-2 text-xs text-gray-400 select-all cursor-pointer bg-gray-900 p-2 rounded border border-gray-700">
-                                      ID: {hostId}
-                                  </div>
-                              )}
+                              <div className="text-xs text-gray-500 mb-1">STATUS: <span className="text-green-400 font-mono">{connectionStatus}</span></div>
+                              {isHost && hostId && <div className="mt-2 text-xs text-gray-400 select-all cursor-pointer bg-gray-900 p-2 rounded border border-gray-700">ID: {hostId}</div>}
                           </div>
                       )}
                   </div>
@@ -882,14 +867,13 @@ export default function App() {
   }
 
   return (
-    <div className="w-full h-screen bg-gray-900 text-white flex flex-col overflow-hidden font-sans relative">
+    <div className="w-full h-screen bg-gray-900 text-white flex flex-col md:flex-row overflow-hidden font-sans relative">
       <div className="absolute inset-0 pointer-events-none opacity-20 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')]"></div>
       
       {/* Modal Overlay */}
       {game.pendingDecision && (
-        <div className="absolute inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm">
+        <div className="absolute inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
            <div className="bg-gray-800 border-2 border-yellow-500 p-6 rounded-lg shadow-xl max-w-sm w-full animate-pop-in">
-               
                {game.pendingDecision.type === 'OFFER_COMPLETE_SYSTEM' && (
                    <>
                        <h3 className="text-xl font-bold text-yellow-500 mb-4">Complete System?</h3>
@@ -897,7 +881,6 @@ export default function App() {
                        <button onClick={() => handleCompleteSystem(false)} className="w-full py-2 bg-gray-700 rounded hover:bg-gray-600">No, Star Only</button>
                    </>
                )}
-
                {game.pendingDecision.type === 'PROTO_STAR_CHOICE' && (
                    <>
                        <h3 className="text-xl font-bold text-yellow-500 mb-4">Proto-Star Action</h3>
@@ -905,7 +888,6 @@ export default function App() {
                        <button onClick={() => handleProtoChoice('SEARCH')} className="w-full py-2 bg-purple-600 rounded font-bold hover:bg-purple-500">Search White Dwarf</button>
                    </>
                )}
-
                {game.pendingDecision.type === 'SELECT_VOID_CLASS' && (
                    <>
                        <h3 className="text-xl font-bold text-purple-500 mb-4">Ban Star Class</h3>
@@ -917,7 +899,6 @@ export default function App() {
                        </div>
                    </>
                )}
-
                {game.pendingDecision.type === 'SELECT_DESTRUCTION_TARGET' && (
                    <>
                        <h3 className="text-xl font-bold text-red-500 mb-4">Destroy Target</h3>
@@ -928,7 +909,6 @@ export default function App() {
                        </div>
                    </>
                )}
-
                <button onClick={() => setGame(prev => ({...prev, pendingDecision: null}))} className="mt-6 text-xs text-gray-500 hover:text-white underline w-full text-center">Cancel</button>
            </div>
         </div>
@@ -936,202 +916,180 @@ export default function App() {
 
       {/* Victory Screen */}
       {game.winner && (
-          <div className="absolute inset-0 z-[200] bg-black/95 flex flex-col items-center justify-center animate-slide-up">
-              <h1 className="text-6xl font-bold text-yellow-500 mb-4">VICTORY</h1>
-              <p className="text-2xl text-white mb-8 text-center px-4">{game.victoryReason}</p>
+          <div className="absolute inset-0 z-[200] bg-black/95 flex flex-col items-center justify-center animate-slide-up p-4 text-center">
+              <h1 className="text-4xl md:text-6xl font-bold text-yellow-500 mb-4">VICTORY</h1>
+              <p className="text-xl md:text-2xl text-white mb-8 px-4">{game.victoryReason}</p>
               <button onClick={() => setGame(initialState)} className="px-8 py-3 bg-white text-black font-bold rounded-full hover:scale-105 transition">Return to Menu</button>
           </div>
       )}
 
-      {/* Top Bar */}
-      <div className="h-16 flex-none bg-gray-950 flex items-center justify-between px-6 border-b border-gray-800 z-10 relative">
-         <div className="flex items-center space-x-4">
-            <div className={`w-3 h-3 rounded-full ${game.activePlayerId === 1 ? 'bg-gray-600' : 'bg-red-500'}`}></div>
-            <span className="font-bold text-lg text-gray-300">
-              {getOpponentPlayer().name}
-            </span>
-            <span className="text-sm text-gray-500 bg-gray-900 px-2 py-1 rounded">Hand: {getOpponentPlayer().hand.length}</span>
-            <span className="text-xs text-yellow-600 border border-yellow-900 px-2 py-1 rounded">Systems: {getOpponentPlayer().systemsCompleted}/3</span>
-         </div>
-         <div className="text-white font-bold text-xl tracking-wider text-yellow-500/80">NOVACANA</div>
-      </div>
-
-      <div className="flex-1 flex relative overflow-hidden min-h-0" 
-           onDragOver={handleDragOverBoard}
-           onDrop={handleDropOnBoard}
+      {/* Mobile Info Toggle */}
+      <button 
+        onClick={() => setShowMobileInfo(!showMobileInfo)} 
+        className="md:hidden absolute top-2 right-2 z-50 bg-gray-800 border border-gray-600 p-2 rounded text-xs text-yellow-500"
       >
-        
-        {/* Sidebar Left: Deck/Void */}
-        <div className="w-32 bg-gray-900/50 flex flex-col justify-center items-center space-y-8 p-2 border-r border-white/5 z-20 relative flex-none">
-            <div className="w-24 h-36 rounded-lg border-2 border-gray-600 flex flex-col items-center justify-center bg-gray-800">
-                <div className="text-gray-400 text-xs font-bold mb-1">DECK</div>
-                <div className="text-2xl font-bold">{game.deck.length}</div>
-            </div>
-            <div 
-                className={`w-24 h-24 rounded-full border-4 border-double border-purple-900 flex flex-col items-center justify-center bg-black transition-all cursor-help relative ${dragOverDiscard ? 'scale-110 border-purple-500' : ''}`}
-                onDragOver={handleDragOverDiscard}
-                onDrop={handleDropOnDiscard}
+        {showMobileInfo ? "Hide Info" : "Show Info"}
+      </button>
+
+      {/* Left Sidebar (Deck/Void) - Responsive */}
+      <div className="flex-none bg-gray-900/90 md:bg-gray-900/50 flex flex-row md:flex-col items-center justify-between md:justify-center p-2 border-b md:border-b-0 md:border-r border-white/10 z-20 w-full md:w-32 h-16 md:h-auto">
+          <div className="flex items-center space-x-2 md:space-x-0 md:flex-col md:space-y-8" onClick={() => executePlayOnBoard(null)}>
+             <div className="w-10 h-14 md:w-24 md:h-36 rounded border border-gray-600 flex flex-col items-center justify-center bg-gray-800">
+                <div className="text-gray-400 text-[8px] md:text-xs font-bold">DECK</div>
+                <div className="text-xs md:text-2xl font-bold">{game.deck.length}</div>
+             </div>
+             <div 
+                className={`w-10 h-10 md:w-24 md:h-24 rounded-full border-2 md:border-4 border-double border-purple-900 flex flex-col items-center justify-center bg-black cursor-pointer relative ${dragOverDiscard ? 'scale-110 border-purple-500' : ''}`}
+                onDragOver={(e) => { e.preventDefault(); setDragOverDiscard(true); }}
+                onDrop={(e) => { e.preventDefault(); setDragOverDiscard(false); if(draggedCard) handleDiscard(draggedCard); }}
+                onClick={() => { if(selectedClickCard) handleDiscard(selectedClickCard); }}
                 onMouseEnter={() => setShowVoidPreview(true)}
                 onMouseLeave={() => setShowVoidPreview(false)}
             >
-                <div className="text-purple-400 text-[10px] font-bold tracking-widest">VOID</div>
-                <div className="text-xs text-purple-700 mt-1">{game.discardPile.length}</div>
-                
-                {/* Void Preview */}
+                <div className="text-purple-400 text-[6px] md:text-[10px] font-bold tracking-widest">VOID</div>
+                <div className="text-[8px] md:text-xs text-purple-700">{game.discardPile.length}</div>
                 {showVoidPreview && (
-                    <div className="absolute left-full ml-4 top-0 bg-gray-900 border border-purple-500 p-3 rounded-lg shadow-2xl z-50 w-56 max-h-80 overflow-y-auto">
-                        <div className="text-xs font-bold text-purple-400 mb-2 border-b border-purple-800 pb-1">VOID CONTENT</div>
-                        {game.discardPile.map((c, i) => (
-                            <div key={i} className="text-xs text-gray-300 py-1 border-b border-gray-800 flex justify-between">
-                                <span>{c.name}</span>
-                                <span className="text-[10px] text-gray-600">{c.type[0]}</span>
-                            </div>
-                        ))}
+                    <div className="absolute left-0 md:left-full top-full md:top-0 mt-2 md:ml-4 bg-gray-900 border border-purple-500 p-2 rounded-lg shadow-2xl z-50 w-40 md:w-56 max-h-60 overflow-y-auto">
+                        {game.discardPile.map((c, i) => <div key={i} className="text-xs text-gray-300 py-1 border-b border-gray-800 flex justify-between"><span>{c.name}</span><span className="text-[10px] text-gray-600">{c.type[0]}</span></div>)}
                     </div>
                 )}
             </div>
-        </div>
+          </div>
+          <div className="md:hidden text-xs text-yellow-500 font-bold">
+             Turn {game.turnCount}
+          </div>
+      </div>
 
-        {/* Board */}
-        <div className="flex-1 flex flex-col relative z-0 min-h-0 min-w-0">
-           {/* Opponent Board */}
-           <div className="flex-1 border-b border-white/5 p-4 flex items-center justify-center space-x-4 bg-black/20 overflow-x-auto min-h-0">
-              {getOpponentPlayer().board.map(star => (
-                 <Card key={star.id} card={star} location="opponent" onDrop={(e) => handleDropOnStar(e, star)} onHover={setHoveredCard} />
-              ))}
+      {/* Main Board Area */}
+      <div className="flex-1 flex flex-col relative z-0 min-h-0 min-w-0">
+           {/* Top Bar (Opponent) */}
+           <div className="h-12 md:h-16 flex-none bg-gray-950 flex items-center justify-between px-4 border-b border-gray-800 z-10">
+              <div className="flex items-center space-x-2 md:space-x-4">
+                  <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${game.activePlayerId === 1 ? 'bg-gray-600' : 'bg-red-500'}`}></div>
+                  <span className="font-bold text-sm md:text-lg text-gray-300">{getOpponentPlayer().name}</span>
+                  <span className="text-xs text-gray-500 bg-gray-900 px-2 py-1 rounded">Hand: {getOpponentPlayer().hand.length}</span>
+                  <span className="hidden md:inline text-xs text-yellow-600 border border-yellow-900 px-2 py-1 rounded">Systems: {getOpponentPlayer().systemsCompleted}/3</span>
+              </div>
+              <div className="hidden md:block text-white font-bold text-xl tracking-wider text-yellow-500/80">NOVACANA</div>
            </div>
 
-           {/* Chain */}
-           {game.chainStack.length > 0 && (
-             <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm pointer-events-none">
-                <div className="flex flex-col items-center w-full h-full relative">
-                   <h2 className="text-3xl font-bold mb-4 mt-8 text-yellow-400 drop-shadow-md uppercase tracking-widest">
-                     {game.isResolving ? "Resolving Chain" : "Chain Pending"}
-                   </h2>
-                   
-                   {/* Stack Visual - Dimmed when resolving specific card */}
-                   <div className="flex items-center justify-center space-x-[-80px] mb-8 perspective-1000 min-h-[120px]">
-                      {game.chainStack.map((c, i) => {
-                        const isCurrent = c.id === game.resolvingCardId;
-                        return (
-                            <div 
-                                key={c.id} 
-                                style={{ 
-                                    transform: `translateX(${i * 30}px) translateZ(${i * 5}px) scale(${1 - (game.chainStack.length - i) * 0.05})`, 
-                                    zIndex: i,
-                                    opacity: game.isResolving && !isCurrent ? 0.3 : 1
-                                }}
-                            >
-                               {/* Tiny preview cards in stack */}
-                               <div className={`w-20 h-32 rounded bg-gray-700 border border-gray-500 shadow-xl`}></div>
-                            </div>
-                        );
-                      })}
-                   </div>
-
-                   {/* ACTIVE RESOLVING CARD DISPLAY */}
-                   <div className="flex-1 flex items-center justify-center w-full relative">
-                        {game.isResolving && game.resolvingCardId && (
-                            <div className="animate-pop-in z-50 flex flex-col items-center">
-                                <Card 
-                                    card={game.chainStack.find(c => c.id === game.resolvingCardId)!} 
-                                    location="chain" 
-                                    isResolving={true} 
-                                />
-                                <div className="mt-6 text-2xl font-bold text-white text-center bg-black/60 px-6 py-2 rounded-full border border-yellow-500/50">
-                                    Resolving Effect...
-                                </div>
-                            </div>
-                        )}
-                        {!game.isResolving && (
-                             <div className="z-50 animate-pop-in">
-                                 <Card 
-                                    card={game.chainStack[game.chainStack.length - 1]} 
-                                    location="chain" 
-                                 />
-                                 <div className="mt-4 text-center text-gray-400 text-sm">Most Recent Link</div>
-                             </div>
-                        )}
-                   </div>
-
-                   {!game.isResolving && (
-                     <div className="mb-12 pointer-events-auto">
-                        <button onClick={nextPhaseOrTurn} className="bg-red-600 hover:bg-red-500 text-white font-bold py-4 px-12 rounded-full shadow-[0_0_30px_rgba(220,38,38,0.6)] transform hover:scale-105 transition-all uppercase tracking-widest text-lg border-2 border-red-400">
-                            Resolve Chain
-                        </button>
-                     </div>
-                   )}
-                </div>
-             </div>
-           )}
-
-           {/* Player Board */}
+           {/* Play Area */}
            <div 
-             className={`flex-1 p-4 flex items-center justify-center space-x-6 transition-colors duration-300 relative overflow-x-auto min-h-0 ${dragOverBoard ? 'bg-indigo-900/30' : ''}`}
+             className="flex-1 flex flex-col relative z-0 min-h-0 min-w-0 overflow-hidden"
+             onDragOver={(e) => { e.preventDefault(); setDragOverBoard(true); }}
+             onDrop={(e) => { e.preventDefault(); setDragOverBoard(false); executePlayOnBoard(null); }}
+             onClick={() => executePlayOnBoard(null)} // Tap to Play on Board
            >
-              {getActivePlayer().board.length === 0 && !draggedCard && (
-                  <div className="text-gray-500/30 border-2 border-dashed border-gray-700/50 rounded-xl p-10 select-none pointer-events-none">
-                      Deploy Stars or Effects Here
-                  </div>
-              )}
-              {getActivePlayer().board.map(star => (
-                 <Card key={star.id} card={star} location="board" onHover={setHoveredCard} onDrop={(e) => handleDropOnStar(e, star)} />
-              ))}
-           </div>
-        </div>
+               {/* Opponent Board (Top Half) */}
+               <div className="flex-1 border-b border-white/5 p-2 md:p-4 flex items-center justify-start md:justify-center space-x-2 md:space-x-4 bg-black/20 overflow-x-auto min-h-0">
+                  {getOpponentPlayer().board.map(star => (
+                     <Card 
+                       key={star.id} 
+                       card={star} 
+                       location="opponent" 
+                       onDrop={(e) => { e.preventDefault(); e.stopPropagation(); executePlayOnStar(star, null); }}
+                       onClick={(e) => { e.stopPropagation(); executePlayOnStar(star, null); }}
+                       onHover={setHoveredCard} 
+                     />
+                  ))}
+               </div>
 
-        {/* Sidebar Right: Info */}
-        <div className="w-80 bg-gray-900 border-l border-gray-800 flex flex-col z-20 shadow-2xl relative flex-none h-full min-h-0">
+               {/* Player Board (Bottom Half) */}
+               <div className={`flex-1 p-2 md:p-4 flex items-center justify-start md:justify-center space-x-2 md:space-x-6 transition-colors duration-300 relative overflow-x-auto min-h-0 ${dragOverBoard ? 'bg-indigo-900/10' : ''}`}>
+                  {getActivePlayer().board.length === 0 && !draggedCard && !selectedClickCard && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                          <div className="text-gray-500/30 border-2 border-dashed border-gray-700/50 rounded-xl p-4 md:p-10 text-xs md:text-base">Deploy Stars or Effects Here</div>
+                      </div>
+                  )}
+                  {getActivePlayer().board.map(star => (
+                     <Card 
+                       key={star.id} 
+                       card={star} 
+                       location="board" 
+                       onHover={setHoveredCard} 
+                       onDrop={(e) => { e.preventDefault(); e.stopPropagation(); executePlayOnStar(star, null); }}
+                       onClick={(e) => { e.stopPropagation(); executePlayOnStar(star, null); }}
+                     />
+                  ))}
+               </div>
+
+               {/* Chain Overlay */}
+               {game.chainStack.length > 0 && (
+                 <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
+                    <div className="flex flex-col items-center w-full h-full relative justify-center">
+                       <h2 className="text-2xl md:text-3xl font-bold mb-4 text-yellow-400 drop-shadow-md uppercase tracking-widest">
+                         {game.isResolving ? "Resolving Chain" : "Chain Pending"}
+                       </h2>
+                       <div className="flex items-center justify-center space-x-[-40px] md:space-x-[-80px] mb-8 perspective-1000 min-h-[120px]">
+                          {game.chainStack.map((c, i) => {
+                            const isCurrent = c.id === game.resolvingCardId;
+                            return (
+                                <div key={c.id} style={{ transform: `translateX(${i * (window.innerWidth < 768 ? 15 : 30)}px) translateZ(${i * 5}px) scale(${1 - (game.chainStack.length - i) * 0.05})`, zIndex: i, opacity: game.isResolving && !isCurrent ? 0.3 : 1 }}>
+                                   <div className="w-14 h-20 md:w-20 md:h-32 rounded bg-gray-700 border border-gray-500 shadow-xl"></div>
+                                </div>
+                            );
+                          })}
+                       </div>
+                       <div className="flex-1 flex items-center justify-center w-full relative max-h-[40%]">
+                            {game.isResolving && game.resolvingCardId && (
+                                <div className="animate-pop-in z-50 flex flex-col items-center">
+                                    <Card card={game.chainStack.find(c => c.id === game.resolvingCardId)!} location="chain" isResolving={true} />
+                                    <div className="mt-4 text-xl font-bold text-white text-center bg-black/60 px-4 py-1 rounded-full border border-yellow-500/50">Resolving...</div>
+                                </div>
+                            )}
+                            {!game.isResolving && (
+                                 <div className="z-50 animate-pop-in scale-75 md:scale-100">
+                                     <Card card={game.chainStack[game.chainStack.length - 1]} location="chain" />
+                                 </div>
+                            )}
+                       </div>
+                       {!game.isResolving && (
+                         <div className="mb-8 pointer-events-auto">
+                            <button onClick={nextPhaseOrTurn} className="bg-red-600 hover:bg-red-500 text-white font-bold py-3 px-8 md:py-4 md:px-12 rounded-full shadow-lg transform hover:scale-105 transition-all uppercase tracking-widest text-sm md:text-lg border-2 border-red-400">Resolve Chain</button>
+                         </div>
+                       )}
+                    </div>
+                 </div>
+               )}
+           </div>
+      </div>
+
+      {/* Sidebar Right: Info (Mobile Toggle / Desktop Fixed) */}
+      <div className={`${showMobileInfo ? 'flex' : 'hidden'} md:flex flex-col absolute md:relative inset-0 md:inset-auto bg-gray-900/95 md:bg-gray-900 border-l border-gray-800 z-40 w-full md:w-80 h-full min-h-0`}>
+           {showMobileInfo && <button onClick={() => setShowMobileInfo(false)} className="absolute top-2 right-2 text-white md:hidden">Close</button>}
            <div className="h-2/5 p-4 border-b border-gray-800 bg-gray-800/50 flex-none overflow-hidden">
              {hoveredCard ? (
                 <div className="h-full flex flex-col">
                    <div className="text-xl font-bold text-yellow-400 mb-1">{hoveredCard.name}</div>
                    <div className="text-xs text-gray-400 mb-4">{hoveredCard.type} {hoveredCard.classValue ? `• Class ${hoveredCard.classValue}` : ''}</div>
                    <div className="text-sm text-gray-200 leading-relaxed pr-2 mb-4">{hoveredCard.effectText}</div>
-                   
-                   {/* Attachments List */}
                    {(hoveredCard as BoardCard).attachments?.length > 0 && (
                        <div className="flex-1 overflow-y-auto border-t border-gray-700 pt-2">
                            <div className="text-[10px] font-bold text-gray-500 uppercase mb-2">Orbiting Bodies</div>
                            {(hoveredCard as BoardCard).attachments.map(a => (
-                               <div key={a.id} className="flex items-center text-xs text-green-400 mb-1">
-                                   <span className="mr-2">●</span> {a.name}
-                               </div>
+                               <div key={a.id} className="flex items-center text-xs text-green-400 mb-1"><span className="mr-2">●</span> {a.name}</div>
                            ))}
                        </div>
                    )}
                 </div>
-             ) : (
-                <div className="h-full flex items-center justify-center text-gray-500 text-sm italic">Hover over a card</div>
-             )}
+             ) : <div className="h-full flex items-center justify-center text-gray-500 text-sm italic">Hover card for info</div>}
            </div>
-           
            <div className="flex-1 p-4 overflow-y-auto font-mono text-xs space-y-2 bg-black/40 min-h-0">
               {game.logs.map((log, idx) => <div key={idx} className="text-gray-400 border-l-2 border-gray-700 pl-2 py-1">{log}</div>)}
               <div ref={logsEndRef} />
            </div>
-
            <div className="p-4 border-t border-gray-800 bg-gray-900 flex-none">
-              <div className="text-xs text-center text-gray-500 mb-2">
-                  Systems Completed: <span className="text-yellow-500 font-bold">{getActivePlayer().systemsCompleted}/3</span>
-              </div>
-              <button 
-                onClick={nextPhaseOrTurn}
-                disabled={game.isResolving || !!game.pendingDecision}
-                className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 text-black font-bold rounded shadow-lg transition"
-              >
-                {game.phase === Phase.Action ? "End Turn" : "Pass Priority"}
-              </button>
+              <div className="text-xs text-center text-gray-500 mb-2">Systems Completed: <span className="text-yellow-500 font-bold">{getActivePlayer().systemsCompleted}/3</span></div>
+              <button onClick={nextPhaseOrTurn} disabled={game.isResolving || !!game.pendingDecision} className="w-full py-3 bg-yellow-600 hover:bg-yellow-500 text-black font-bold rounded shadow-lg transition">{game.phase === Phase.Action ? "End Turn" : "Pass Priority"}</button>
            </div>
-        </div>
       </div>
 
       {/* Hand */}
-      <div className="h-48 bg-black/80 backdrop-blur-md border-t border-gray-800 relative z-30 flex-none">
-        <div className="absolute top-0 left-0 bg-yellow-600 text-black text-xs font-bold px-3 py-1 rounded-br-lg z-40">
+      <div className="h-32 md:h-48 bg-black/80 backdrop-blur-md border-t border-gray-800 relative z-30 flex-none">
+        <div className="absolute top-0 left-0 bg-yellow-600 text-black text-[10px] md:text-xs font-bold px-2 py-1 md:px-3 rounded-br-lg z-40">
            {getActivePlayer().name} (Active)
         </div>
-        <div className="w-full h-full flex items-center justify-center overflow-x-auto pt-4 pb-2 px-10 gap-2">
+        <div className="w-full h-full flex items-center justify-start md:justify-center overflow-x-auto pt-2 pb-2 px-4 md:px-10 gap-2">
            {getActivePlayer().hand.map(card => (
               <Card 
                 key={card.id} 
@@ -1139,8 +1097,9 @@ export default function App() {
                 location="hand" 
                 onHover={setHoveredCard}
                 onDragStart={handleDragStart}
+                onClick={(e) => { e?.stopPropagation(); handleHandCardInteraction(card); }}
                 isDragging={draggedCard?.id === card.id}
-                onClick={() => { if (game.selectionMode === 'DISCARD_TO_FIVE') handleDiscard(card); }}
+                isSelected={selectedClickCard?.id === card.id}
               />
            ))}
         </div>
