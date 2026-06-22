@@ -6,6 +6,7 @@ mod mcts;
 mod generate;
 mod net;
 mod net_v6;
+mod net_v6_burn;
 mod player;
 mod self_play;
 mod self_play_v6;
@@ -26,9 +27,16 @@ use novacana_engine::{
     chain::ChainView,
 };
 
+use burn::backend::Autodiff;
+use burn::tensor::backend::AutodiffBackend;
+use burn_ndarray::{NdArray, NdArrayDevice};
+#[cfg(feature = "gpu")]
+use burn_wgpu::{Wgpu, WgpuDevice};
+
 use candidate::{CAND_DIM, encode_card_candidate, encode_system_candidate, encode_target_candidate};
 use feature_v6::{encode_v6, FEATURE_DIM_V6};
-use net_v6::{NetV6, OptimizerV6, WeightsV6, RlBatchV6, rl_train_step_v6, INPUT_DIM};
+use net_v6::{NetV6, WeightsV6, INPUT_DIM};
+use net_v6_burn::{NetV6Burn, make_optimizer, rl_train_step_burn};
 use self_play_v6::{run_self_play_v6, PerBuffer};
 
 // ── OpenBLAS thread count switching ──────────────────────────────────────────
@@ -304,84 +312,70 @@ fn cmd_eval(args: &[String]) {
         num_games, num_players, win_rate * 100.0, t0.elapsed().as_secs_f32());
 }
 
-fn cmd_rl(args: &[String]) {
-    let model_path      = flag_str(args, "--model", "");
-    let out_path        = flag_str(args, "--out", "models/net_v6.bin");
-    let num_iters       = flag_usize(args, "--iters", 300);
-    let games_per       = flag_usize(args, "--games", 2000);
-    let num_players     = flag_usize(args, "--players", 4);
-    let lr              = flag_f32(args, "--lr", 0.0001);
-    let temp_start      = flag_f32(args, "--temp-start", 1.0);
-    let temp_final      = flag_f32(args, "--temp-final", 0.3);
-    let ent_start       = flag_f32(args, "--entropy-start", 0.01);
-    let ent_final       = flag_f32(args, "--entropy-final", 0.001);
-    let ppo_epochs      = flag_usize(args, "--ppo-epochs", 4);
-    let batch_size      = flag_usize(args, "--batch-size", 512);
-    let clip_eps        = flag_f32(args, "--clip-eps", 0.2);
-    let snapshot_every  = flag_usize(args, "--snapshot-every", 20);
-    let pool_cap        = flag_usize(args, "--pool-cap", 10);
-    let cand_lr_mult    = flag_f32(args, "--cand-lr-mult", 3.0);
-    let per_alpha       = flag_f32(args, "--per-alpha", 0.6);
-    let per_beta        = flag_f32(args, "--per-beta", 0.4);
-    let per_size        = flag_usize(args, "--per-size", 200_000);
-    let eval_every      = flag_usize(args, "--eval-every", 50);
-    let eval_games      = flag_usize(args, "--eval-games", 400);
-    let gamma           = flag_f32(args, "--gamma", 0.99);
-    let lambda          = flag_f32(args, "--lambda", 0.95);
+// ── Burn training loop (generic over backend) ─────────────────────────────────
 
-    std::fs::create_dir_all(
-        std::path::Path::new(&out_path).parent().unwrap_or(std::path::Path::new("."))
-    ).unwrap();
+#[allow(clippy::too_many_arguments)]
+fn run_rl_burn<B: AutodiffBackend>(
+    initial_weights: WeightsV6,
+    out_path:        &str,
+    num_iters:       usize,
+    games_per:       usize,
+    num_players:     usize,
+    lr:              f32,
+    temp_start:      f32,
+    temp_final:      f32,
+    ent_start:       f32,
+    ent_final:       f32,
+    ppo_epochs:      usize,
+    batch_size:      usize,
+    clip_eps:        f32,
+    snapshot_every:  usize,
+    pool_cap:        usize,
+    per_alpha:       f32,
+    per_beta:        f32,
+    per_size:        usize,
+    eval_every:      usize,
+    eval_games:      usize,
+    gamma:           f32,
+    lambda:          f32,
+    device:          &B::Device,
+) {
+    let mut net_burn = NetV6Burn::<B>::from_weights(&initial_weights, device);
+    let mut opt      = make_optimizer::<B>();
+    // ndarray weights: kept in sync after each iter for game gen, eval, and checkpointing
+    let mut ndarray_weights = initial_weights;
 
-    let mut net = if !model_path.is_empty() {
-        match load_weights_v6(&model_path) {
-            Ok(w) => {
-                println!("Starting from {}", model_path);
-                NetV6::from_weights(&w)
-            }
-            Err(e) => {
-                eprintln!("Warning: could not load {}: {} — starting fresh", model_path, e);
-                NetV6::new()
-            }
-        }
-    } else {
-        println!("Starting from scratch (random weights)");
-        NetV6::new()
-    };
-
-    let mut opt = OptimizerV6::new(lr, cand_lr_mult as f32);
     let mut snapshot_pool: Vec<Arc<WeightsV6>> = Vec::new();
     let mut per = PerBuffer::new(per_size, per_alpha, per_beta);
     let mut rng = thread_rng();
 
     println!(
-        "RL v6 (PPO+PER): {} iters × {} games × {} ppo-epochs  \
-         T={:.2}→{:.2}  ent={:.4}→{:.4}  lr={}  cand_lr_mult={}  snapshot_every={}",
+        "RL v6 (PPO+PER+burn): {} iters × {} games × {} ppo-epochs  \
+         T={:.2}→{:.2}  ent={:.4}→{:.4}  lr={}  snapshot_every={}",
         num_iters, games_per, ppo_epochs,
         temp_start, temp_final, ent_start, ent_final,
-        lr, cand_lr_mult, snapshot_every
+        lr, snapshot_every
     );
 
     for iter in 0..num_iters {
-        // Save snapshot before training this iter
+        // Save snapshot before training this iter (weights from previous iter)
         if iter > 0 && iter % snapshot_every == 0 {
-            snapshot_pool.push(Arc::new(net.to_weights()));
+            snapshot_pool.push(Arc::new(ndarray_weights.clone()));
             if snapshot_pool.len() > pool_cap {
                 snapshot_pool.remove(0);
             }
             println!("  [snapshot saved — pool size {}]", snapshot_pool.len());
         }
 
-        // Linear temperature and entropy schedules
-        let frac     = iter as f32 / num_iters.saturating_sub(1).max(1) as f32;
-        let temperature = temp_start + (temp_final - temp_start) * frac;
-        let entropy_coeff = ent_start + (ent_final - ent_start) * frac;
+        let frac          = iter as f32 / num_iters.saturating_sub(1).max(1) as f32;
+        let temperature   = temp_start + (temp_final   - temp_start) * frac;
+        let entropy_coeff = ent_start  + (ent_final    - ent_start)  * frac;
 
         let t0 = Instant::now();
 
         // Game generation: BLAS single-threaded, rayon owns cores
         openblas_threads(1);
-        let current_weights = Arc::new(net.to_weights());
+        let current_weights = Arc::new(ndarray_weights.clone());
         let new_samples = run_self_play_v6(
             games_per, num_players, current_weights, &snapshot_pool,
             temperature, gamma, lambda,
@@ -389,7 +383,7 @@ fn cmd_rl(args: &[String]) {
         let new_count = new_samples.len();
         per.push_batch(new_samples);
 
-        // Training: BLAS multi-threaded, single-threaded caller
+        // Training: burn backend (WGPU or NdArray)
         openblas_threads(16);
 
         let mut total_policy_loss = 0.0f64;
@@ -399,7 +393,6 @@ fn cmd_rl(args: &[String]) {
         let per_len = per.len();
         if per_len >= batch_size {
             for _ppo in 0..ppo_epochs {
-                // Sample a large working set proportional to priority, then mini-batch it.
                 let sample_n = per_len.min(batch_size * 32);
                 let (indices, is_weights) = per.sample_indices(sample_n);
                 let mut order: Vec<usize> = (0..indices.len()).collect();
@@ -408,7 +401,6 @@ fn cmd_rl(args: &[String]) {
                 for chunk in order.chunks(batch_size) {
                     if chunk.len() < 2 { continue; }
 
-                    // Build batch, skipping any sample whose recorded action isn't in its mask
                     let mut feats:    Vec<Vec<f32>> = Vec::with_capacity(chunk.len());
                     let mut masks:    Vec<u64>      = Vec::with_capacity(chunk.len());
                     let mut actions:  Vec<u8>       = Vec::with_capacity(chunk.len());
@@ -429,21 +421,17 @@ fn cmd_rl(args: &[String]) {
                     }
                     if feats.is_empty() { continue; }
 
-                    let batch = RlBatchV6 {
-                        features:      &feats,
-                        masks:         &masks,
-                        actions:       &actions,
-                        outcomes:      &outcomes,
-                        old_log_probs: &old_lps,
-                        is_weights:    &is_w,
-                    };
-                    let (pl, vl) = rl_train_step_v6(&mut net, &mut opt, &batch, entropy_coeff, clip_eps);
+                    let (nb, pl, vl) = rl_train_step_burn(
+                        net_burn, &mut opt, lr as f64,
+                        &feats, &masks, &actions, &outcomes, &old_lps, &is_w,
+                        entropy_coeff, clip_eps, device,
+                    );
+                    net_burn = nb;
                     total_policy_loss += pl as f64;
                     total_value_loss  += vl as f64;
                     num_batches += 1;
                 }
 
-                // Refresh PER priorities using stored td_error (proxy for |advantage|)
                 let td_errors: Vec<f32> = indices.iter()
                     .map(|&i| per.samples[i].td_error)
                     .collect();
@@ -451,8 +439,10 @@ fn cmd_rl(args: &[String]) {
             }
         }
 
-        // Anneal PER beta toward 1.0
         per.anneal_beta(1.0, 1.0 / num_iters as f32);
+
+        // Sync burn → ndarray weights (one GPU→CPU copy per iter)
+        ndarray_weights = net_burn.to_weights();
 
         let elapsed = t0.elapsed().as_secs_f32();
         let avg_pl = if num_batches > 0 { total_policy_loss / num_batches as f64 } else { 0.0 };
@@ -465,15 +455,13 @@ fn cmd_rl(args: &[String]) {
             snapshot_pool.len(), elapsed,
         );
 
-        // Save checkpoint
         openblas_threads(1);
-        if let Err(e) = save_weights_v6(&net.to_weights(), &out_path) {
+        if let Err(e) = save_weights_v6(&ndarray_weights, out_path) {
             eprintln!("Warning: failed to save {}: {}", out_path, e);
         }
 
-        // Periodic eval
         if eval_every > 0 && (iter + 1) % eval_every == 0 {
-            let net_arc = Arc::new(NetV6::from_weights(&net.to_weights()));
+            let net_arc = Arc::new(NetV6::from_weights(&ndarray_weights));
             let win_rate = eval_v6(&net_arc, eval_games, num_players);
             println!("  Eval @ iter {}: {:.1}% win rate vs {} AdvCPU  ({} games)",
                 iter + 1, win_rate * 100.0, num_players - 1, eval_games);
@@ -482,4 +470,76 @@ fn cmd_rl(args: &[String]) {
 
     println!("Training complete. Model saved → {}", out_path);
     openblas_threads(1);
+}
+
+fn cmd_rl(args: &[String]) {
+    let model_path     = flag_str(args, "--model", "");
+    let out_path       = flag_str(args, "--out", "models/net_v6.bin");
+    let num_iters      = flag_usize(args, "--iters", 300);
+    let games_per      = flag_usize(args, "--games", 2000);
+    let num_players    = flag_usize(args, "--players", 4);
+    let lr             = flag_f32(args, "--lr", 0.0001);
+    let temp_start     = flag_f32(args, "--temp-start", 1.0);
+    let temp_final     = flag_f32(args, "--temp-final", 0.3);
+    let ent_start      = flag_f32(args, "--entropy-start", 0.01);
+    let ent_final      = flag_f32(args, "--entropy-final", 0.001);
+    let ppo_epochs     = flag_usize(args, "--ppo-epochs", 4);
+    let batch_size     = flag_usize(args, "--batch-size", 512);
+    let clip_eps       = flag_f32(args, "--clip-eps", 0.2);
+    let snapshot_every = flag_usize(args, "--snapshot-every", 20);
+    let pool_cap       = flag_usize(args, "--pool-cap", 10);
+    let per_alpha      = flag_f32(args, "--per-alpha", 0.6);
+    let per_beta       = flag_f32(args, "--per-beta", 0.4);
+    let per_size       = flag_usize(args, "--per-size", 200_000);
+    let eval_every     = flag_usize(args, "--eval-every", 50);
+    let eval_games     = flag_usize(args, "--eval-games", 400);
+    let gamma          = flag_f32(args, "--gamma", 0.99);
+    let lambda         = flag_f32(args, "--lambda", 0.95);
+
+    std::fs::create_dir_all(
+        std::path::Path::new(&out_path).parent().unwrap_or(std::path::Path::new("."))
+    ).unwrap();
+
+    let initial_weights = if !model_path.is_empty() {
+        match load_weights_v6(&model_path) {
+            Ok(w)  => { println!("Starting from {}", model_path); w }
+            Err(e) => { eprintln!("Warning: could not load {}: {} — starting fresh", model_path, e); NetV6::new().to_weights() }
+        }
+    } else {
+        println!("Starting from scratch (random weights)");
+        NetV6::new().to_weights()
+    };
+
+    #[cfg(feature = "gpu")]
+    {
+        println!("Backend: WGPU (GPU)");
+        let device = WgpuDevice::default();
+        run_rl_burn::<Autodiff<Wgpu>>(
+            initial_weights, &out_path,
+            num_iters, games_per, num_players, lr,
+            temp_start, temp_final, ent_start, ent_final,
+            ppo_epochs, batch_size, clip_eps,
+            snapshot_every, pool_cap,
+            per_alpha, per_beta, per_size,
+            eval_every, eval_games, gamma, lambda,
+            &device,
+        );
+        return;
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        println!("Backend: NdArray (CPU)");
+        let device = NdArrayDevice::Cpu;
+        run_rl_burn::<Autodiff<NdArray>>(
+            initial_weights, &out_path,
+            num_iters, games_per, num_players, lr,
+            temp_start, temp_final, ent_start, ent_final,
+            ppo_epochs, batch_size, clip_eps,
+            snapshot_every, pool_cap,
+            per_alpha, per_beta, per_size,
+            eval_every, eval_games, gamma, lambda,
+            &device,
+        );
+    }
 }
