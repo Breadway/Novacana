@@ -33,13 +33,28 @@ pub struct NetV6Burn<B: Backend> {
     lc2: Linear<B>,   // cand out:  HC → 1
 }
 
+// Burn's Linear stores weight as [d_input, d_output] and computes y = x @ W (no transpose).
+// WeightsV6 (ndarray convention) stores weights as [d_output, d_input].
+// These helpers convert between the two layouts.
+fn t_flat(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    // [rows, cols] row-major → [cols, rows] row-major
+    let mut out = vec![0.0f32; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
 impl<B: Backend> NetV6Burn<B> {
     /// Load from serialisable WeightsV6 (ndarray inference format).
     pub fn from_weights(w: &WeightsV6, device: &B::Device) -> Self {
         use burn::module::{Param, ParamId};
 
-        let mk2 = |data: &[f32], rows: usize, cols: usize| -> Tensor<B, 2> {
-            Tensor::from_data(TensorData::new(data.to_vec(), [rows, cols]), device)
+        // mk2_t: ndarray weight [out, in] → burn weight [in, out]
+        let mk2_t = |data: &[f32], out_dim: usize, in_dim: usize| -> Tensor<B, 2> {
+            Tensor::from_data(TensorData::new(t_flat(data, out_dim, in_dim), [in_dim, out_dim]), device)
         };
         let mk1 = |data: &[f32], len: usize| -> Tensor<B, 1> {
             Tensor::from_data(TensorData::new(data.to_vec(), [len]), device)
@@ -50,34 +65,36 @@ impl<B: Backend> NetV6Burn<B> {
         };
 
         Self {
-            l1:  lin(mk2(&w.w1,  H,           INPUT_DIM),    mk1(&w.b1,  H)),
-            l2:  lin(mk2(&w.w2,  H,           H),            mk1(&w.b2,  H)),
-            l3:  lin(mk2(&w.w3,  H,           H),            mk1(&w.b3,  H)),
-            l4:  lin(mk2(&w.w4,  H,           H),            mk1(&w.b4,  H)),
-            lp:  lin(mk2(&w.wp,  NUM_ACTIONS, H),            mk1(&w.bp,  NUM_ACTIONS)),
-            lv:  lin(mk2(&w.wv,  1,           H),            mk1(&w.bv,  1)),
-            lc1: lin(mk2(&w.wc1, HC,          H + CAND_DIM), mk1(&w.bc1, HC)),
-            lc2: lin(mk2(&w.wc2, 1,           HC),           mk1(&w.bc2, 1)),
+            l1:  lin(mk2_t(&w.w1,  H,           INPUT_DIM),    mk1(&w.b1,  H)),
+            l2:  lin(mk2_t(&w.w2,  H,           H),            mk1(&w.b2,  H)),
+            l3:  lin(mk2_t(&w.w3,  H,           H),            mk1(&w.b3,  H)),
+            l4:  lin(mk2_t(&w.w4,  H,           H),            mk1(&w.b4,  H)),
+            lp:  lin(mk2_t(&w.wp,  NUM_ACTIONS, H),            mk1(&w.bp,  NUM_ACTIONS)),
+            lv:  lin(mk2_t(&w.wv,  1,           H),            mk1(&w.bv,  1)),
+            lc1: lin(mk2_t(&w.wc1, HC,          H + CAND_DIM), mk1(&w.bc1, HC)),
+            lc2: lin(mk2_t(&w.wc2, 1,           HC),           mk1(&w.bc2, 1)),
         }
     }
 
     /// Extract back to WeightsV6 for ndarray inference / checkpointing.
     pub fn to_weights(&self) -> WeightsV6 {
-        let get2 = |l: &Linear<B>| -> Vec<f32> {
-            l.weight.val().into_data().to_vec::<f32>().expect("weight f32")
+        // get2_t: burn weight [in, out] → ndarray weight [out, in]
+        let get2_t = |l: &Linear<B>, in_dim: usize, out_dim: usize| -> Vec<f32> {
+            let data = l.weight.val().into_data().to_vec::<f32>().expect("weight f32");
+            t_flat(&data, in_dim, out_dim)
         };
         let get1 = |l: &Linear<B>| -> Vec<f32> {
             l.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().expect("bias f32")
         };
         WeightsV6 {
-            w1: get2(&self.l1), b1: get1(&self.l1),
-            w2: get2(&self.l2), b2: get1(&self.l2),
-            w3: get2(&self.l3), b3: get1(&self.l3),
-            w4: get2(&self.l4), b4: get1(&self.l4),
-            wp: get2(&self.lp), bp: get1(&self.lp),
-            wv: get2(&self.lv), bv: get1(&self.lv),
-            wc1: get2(&self.lc1), bc1: get1(&self.lc1),
-            wc2: get2(&self.lc2), bc2: get1(&self.lc2),
+            w1: get2_t(&self.l1, INPUT_DIM,     H),            b1: get1(&self.l1),
+            w2: get2_t(&self.l2, H,             H),            b2: get1(&self.l2),
+            w3: get2_t(&self.l3, H,             H),            b3: get1(&self.l3),
+            w4: get2_t(&self.l4, H,             H),            b4: get1(&self.l4),
+            wp: get2_t(&self.lp, H,             NUM_ACTIONS),  bp: get1(&self.lp),
+            wv: get2_t(&self.lv, H,             1),            bv: get1(&self.lv),
+            wc1: get2_t(&self.lc1, H + CAND_DIM, HC),         bc1: get1(&self.lc1),
+            wc2: get2_t(&self.lc2, HC,           1),           bc2: get1(&self.lc2),
         }
     }
 }
