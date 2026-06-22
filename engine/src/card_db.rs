@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-static RAW_CSV: &str = include_str!("../../../Novacana Info.csv");
+static RAW_CSV: &str = include_str!("cards.csv");
 static DB: OnceLock<HashMap<String, CardEntry>> = OnceLock::new();
 
 pub struct CardEntry {
