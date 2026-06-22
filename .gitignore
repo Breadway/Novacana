@@ -1,0 +1,10 @@
+/target/
+/data/
+/games/
+/logs/
+/models/
+src.zip
+*.bin
+*.bin.bak
+.idea/
+.claude/

@@ -1,0 +1,1885 @@
+use std::collections::HashMap;
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
+
+use crate::card::{Card, CardId, CardKind, DiscoveryName, FlareName, FractureName, OmenName, StarName};
+use crate::chain::{Chain, ChainLink, ChainView};
+use crate::deck::Deck;
+use crate::player::{
+    Action, ChainAction, ChoiceRequest, GameView, OmenAttachment, OpponentView, Player,
+    ProtostarChoice, Target, TargetOption,
+};
+use crate::star_chart::StarChart;
+
+// ── Observer events ───────────────────────────────────────────────────────────
+
+/// Events sent to the TUI observer thread after each significant state change.
+pub enum GameEvent {
+    /// A plain-text log line.
+    Log(String),
+    /// A full state snapshot — sent after each meaningful action.
+    Snapshot(GameSnapshot),
+    /// Fired before an LLM player starts thinking (for "… is thinking" indicator).
+    Thinking { player_name: String },
+    /// A raw token chunk streamed live from a generating model.
+    ThinkingChunk { player_name: String, text: String },
+    /// Fired when the game ends.
+    GameOver(GameResult),
+}
+
+/// Observable slice of the game state, cloned and sent across the channel.
+pub struct GameSnapshot {
+    pub players: Vec<PlayerSnapshot>,
+    pub deck_size: usize,
+    pub turn: u32,
+    pub dark_matter_void: Option<u8>,
+    /// Human-readable chain link descriptions (empty when no chain is open).
+    pub chain_description: Vec<String>,
+}
+
+pub struct PlayerSnapshot {
+    pub name: String,
+    pub hand_size: usize,
+    pub star_chart: StarChart,
+    pub is_active: bool,
+    pub skip_next_action: bool,
+    pub astral_projected_turns: u8,
+}
+
+// ── Player state ──────────────────────────────────────────────────────────────
+
+pub struct PlayerState {
+    pub name: String,
+    pub hand: Vec<Card>,
+    pub star_chart: StarChart,
+    /// Set by Black Hole — skip the next Action Phase (draw and discard still happen).
+    pub skip_next_action: bool,
+    /// Turns remaining where this player's hand is revealed (Astral Projection).
+    pub astral_projected_turns: u8,
+    /// Omen card IDs whose Planet of Life ability was used last turn (one-turn cooldown).
+    pub planet_of_life_on_cooldown: Vec<CardId>,
+}
+
+impl PlayerState {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            hand: Vec::new(),
+            star_chart: StarChart::new(),
+            skip_next_action: false,
+            astral_projected_turns: 0,
+            planet_of_life_on_cooldown: Vec::new(),
+        }
+    }
+
+    pub fn take_from_hand(&mut self, card_id: CardId) -> Option<Card> {
+        let pos = self.hand.iter().position(|c| c.id == card_id)?;
+        Some(self.hand.remove(pos))
+    }
+
+    pub fn hand_contains(&self, card_id: CardId) -> bool {
+        self.hand.iter().any(|c| c.id == card_id)
+    }
+}
+
+// ── Global effect state ───────────────────────────────────────────────────────
+
+struct DarkMatterVoid {
+    restricted_class: u8,
+    caster_idx: usize,
+}
+
+// ── Win condition ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum WinCondition {
+    /// Controlled 3 complete Solar Systems at end of turn.
+    AstronomicalDomination,
+    /// Played all three unique Supernova Flares simultaneously.
+    CosmicCataclysm,
+}
+
+#[derive(Debug, Clone)]
+pub struct GameResult {
+    pub winner_idx: usize,
+    pub winner_name: String,
+    pub condition: WinCondition,
+    pub turns_elapsed: u32,
+}
+
+// ── Game state ────────────────────────────────────────────────────────────────
+
+pub struct GameState {
+    pub deck: Deck,
+    pub registry: HashMap<CardId, CardKind>,
+    pub players: Vec<PlayerState>,
+    pub active_player_idx: usize,
+    pub turn_number: u32,
+    dark_matter_void: Option<DarkMatterVoid>,
+    stellar_alignment_this_turn: bool,
+}
+
+impl GameState {
+    fn new(deck: Deck, player_names: Vec<String>) -> Self {
+        let registry = deck.registry.clone();
+        let players = player_names.into_iter().map(PlayerState::new).collect();
+        Self {
+            deck,
+            registry,
+            players,
+            active_player_idx: 0,
+            turn_number: 1,
+            dark_matter_void: None,
+            stellar_alignment_this_turn: false,
+        }
+    }
+
+    pub fn reconstruct(&self, id: CardId) -> Option<Card> {
+        self.registry.get(&id).map(|k| Card::new(id, k.clone()))
+    }
+}
+
+// ── Game engine ───────────────────────────────────────────────────────────────
+
+pub struct GameEngine {
+    pub state: GameState,
+    pub players: Vec<Box<dyn Player>>,
+    pub log: Arc<Mutex<Vec<String>>>,
+    observer: Option<SyncSender<GameEvent>>,
+}
+
+impl GameEngine {
+    pub fn new(mut deck: Deck, players: Vec<Box<dyn Player>>) -> Self {
+        let names: Vec<String> = players.iter().map(|p| p.name().to_string()).collect();
+        deck.shuffle();
+        let state = GameState::new(deck, names);
+        Self { state, players, log: Arc::new(Mutex::new(Vec::new())), observer: None }
+    }
+
+    /// Attach a TUI observer. When set, `emit()` suppresses stdout and sends
+    /// `GameEvent::Log` instead; snapshots are pushed after each action.
+    /// Also registers a streaming callback on each player so live token chunks
+    /// are forwarded to the TUI as `GameEvent::ThinkingChunk`.
+    pub fn set_observer(&mut self, tx: SyncSender<GameEvent>) {
+        for (i, player) in self.players.iter().enumerate() {
+            let name = self.state.players[i].name.clone();
+            let tx2 = tx.clone();
+            player.set_thinking_callback(std::sync::Arc::new(move |chunk: String| {
+                let _ = tx2.send(GameEvent::ThinkingChunk {
+                    player_name: name.clone(),
+                    text: chunk,
+                });
+            }));
+        }
+        self.observer = Some(tx);
+    }
+
+    /// Drain any reasoning text the player generated for their last decision
+    /// and emit it to the game log (indented, prefixed with the player's name).
+    fn drain_thinking(&mut self, player_idx: usize) {
+        if let Some(thought) = self.players[player_idx].take_thinking() {
+            let name = self.state.players[player_idx].name.clone();
+            self.emit(format!("[{} reasoning]", name));
+            for line in thought.lines() {
+                let t = line.trim();
+                if !t.is_empty() {
+                    self.emit(format!("  {}", t));
+                }
+            }
+            self.emit(format!("[/{} reasoning]", name));
+        }
+    }
+
+    fn send_snapshot(&self, chain: Option<&Chain>) {
+        let Some(tx) = &self.observer else { return };
+        let active = self.state.active_player_idx;
+        let players = self.state.players.iter().enumerate().map(|(i, p)| PlayerSnapshot {
+            name: p.name.clone(),
+            hand_size: p.hand.len(),
+            star_chart: p.star_chart.clone(),
+            is_active: i == active,
+            skip_next_action: p.skip_next_action,
+            astral_projected_turns: p.astral_projected_turns,
+        }).collect();
+
+        let chain_description = chain.map(|c| {
+            c.resolution_order().iter().enumerate().map(|(i, &raw_idx)| {
+                let link = &c.links[raw_idx];
+                let player_name = self.state.players.get(link.player_idx)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("?");
+                format!(
+                    "CL{} [{}] {} [{}]{}",
+                    i + 1,
+                    player_name,
+                    link.card.kind.type_name(),
+                    link.card,
+                    if link.negated { " (NEGATED)" } else { "" }
+                )
+            }).collect()
+        }).unwrap_or_default();
+
+        let snap = GameSnapshot {
+            players,
+            deck_size: self.state.deck.len(),
+            turn: self.state.turn_number,
+            dark_matter_void: self.state.dark_matter_void.as_ref().map(|d| d.restricted_class),
+            chain_description,
+        };
+        let _ = tx.send(GameEvent::Snapshot(snap));
+    }
+
+    fn notify_thinking(&self, player_idx: usize) {
+        let Some(tx) = &self.observer else { return };
+        let name = self.state.players.get(player_idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let _ = tx.send(GameEvent::Thinking { player_name: name });
+    }
+
+    fn send_game_over(&self, result: &GameResult) {
+        let Some(tx) = &self.observer else { return };
+        let _ = tx.send(GameEvent::GameOver(GameResult {
+            winner_idx: result.winner_idx,
+            winner_name: result.winner_name.clone(),
+            condition: result.condition.clone(),
+            turns_elapsed: result.turns_elapsed,
+        }));
+    }
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
+
+    pub fn run(&mut self) -> GameResult {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        self.deal_initial_hands();
+
+        // Auto-save the log every 10 seconds to games/autosave.log so a game
+        // can be inspected while it is still running.
+        let log_arc = Arc::clone(&self.log);
+        let player_names: Vec<String> = self.state.players.iter()
+            .map(|p| p.name.clone()).collect();
+        let stop_saver = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_saver);
+        let start_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        std::thread::spawn(move || {
+            let _ = std::fs::create_dir_all("games");
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                if stop_clone.load(Ordering::Relaxed) { break; }
+
+                let lines = log_arc.lock().unwrap().clone();
+                let path = format!("games/{}_autosave.log", start_ts);
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "NOVACANA — autosave (in progress)");
+                    let _ = writeln!(f, "Players: {}", player_names.join(", "));
+                    let _ = writeln!(f, "{}", "─".repeat(60));
+                    for line in &lines {
+                        for sub in line.split('\n') {
+                            let t = sub.trim();
+                            if !t.is_empty() { let _ = writeln!(f, "{}", t); }
+                        }
+                    }
+                }
+            }
+        });
+
+        loop {
+            let idx = self.state.active_player_idx;
+            self.emit(format!(
+                "\n══ Turn {} — {} ══",
+                self.state.turn_number,
+                self.state.players[idx].name
+            ));
+
+            self.run_start_of_turn(idx);
+            self.run_draw_phase(idx);
+            self.send_snapshot(None);
+
+            let hand_after_draw = self.state.players[idx].hand.len();
+            if hand_after_draw < 6 {
+                self.state.players[idx].skip_next_action = false;
+                self.emit(format!(
+                    "{} has only {} card(s) — action phase skipped.",
+                    self.state.players[idx].name, hand_after_draw
+                ));
+            } else if let Some(result) = self.run_action_phase(idx) {
+                self.send_game_over(&result);
+                stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                return result;
+            }
+            if let Some(result) = self.run_end_phase(idx) {
+                self.send_game_over(&result);
+                stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                return result;
+            }
+
+            self.state.stellar_alignment_this_turn = false;
+            let n = self.state.players.len();
+            self.state.active_player_idx = (self.state.active_player_idx + 1) % n;
+            self.state.turn_number += 1;
+        }
+    }
+
+    fn deal_initial_hands(&mut self) {
+        for i in 0..self.state.players.len() {
+            for _ in 0..5 {
+                if let Some(card) = self.state.deck.draw() {
+                    self.state.players[i].hand.push(card);
+                }
+            }
+        }
+    }
+
+    // ── Phases ────────────────────────────────────────────────────────────────
+
+    fn run_start_of_turn(&mut self, idx: usize) {
+        // Expire Dark Matter Void at caster's turn start
+        if let Some(dmv) = &self.state.dark_matter_void {
+            if dmv.caster_idx == idx {
+                self.emit("Dark Matter Void expires.".into());
+                self.state.dark_matter_void = None;
+            }
+        }
+
+        // Tick Astral Projection
+        if self.state.players[idx].astral_projected_turns > 0 {
+            self.state.players[idx].astral_projected_turns -= 1;
+            if self.state.players[idx].astral_projected_turns == 0 {
+                self.emit(format!(
+                    "{}'s hand is no longer revealed (Astral Projection expired).",
+                    self.state.players[idx].name
+                ));
+            }
+        }
+
+        // Reset Planet of Life cooldowns for this player
+        self.state.players[idx].planet_of_life_on_cooldown.clear();
+
+        // Solar Eclipse maintenance: each protected system requires discarding 1 card
+        let protected: Vec<CardId> = self.state.players[idx].star_chart.eclipse_protected_stars();
+        for star_id in protected {
+            self.handle_eclipse_maintenance(idx, star_id);
+        }
+    }
+
+    fn handle_eclipse_maintenance(&mut self, player_idx: usize, star_id: CardId) {
+        if self.state.players[player_idx].hand.is_empty() {
+            // Cannot pay — detach
+            if let Some(omen_id) =
+                self.state.players[player_idx].star_chart.detach_solar_eclipse(star_id)
+            {
+                if let Some(c) = self.state.reconstruct(omen_id) {
+                    self.state.deck.push_bottom(c);
+                }
+                let sys_name = self.state.players[player_idx]
+                    .star_chart
+                    .system_for_star(star_id)
+                    .map(|s| s.star_name.to_string())
+                    .unwrap_or_default();
+                self.emit(format!("{}'s Solar Eclipse on {} detaches (no cards to pay).", self.state.players[player_idx].name, sys_name));
+            }
+            return;
+        }
+
+        let sys_name = self.state.players[player_idx]
+            .star_chart
+            .system_for_star(star_id)
+            .map(|s| s.star_name.to_string())
+            .unwrap_or_default();
+
+        let view = self.build_view(player_idx);
+        let req = ChoiceRequest {
+            prompt: format!(
+                "Solar Eclipse on {} requires discarding 1 card to maintain. Pay?",
+                sys_name
+            ),
+            options: vec!["Yes, pay 1 discard".into(), "No, let Eclipse lapse".into()],
+            pick: 1,
+        };
+        let choice = self.players[player_idx].decide(&view, &req);
+                self.drain_thinking(player_idx);
+
+        if choice == 0 {
+            let hand_clone = self.state.players[player_idx].hand.clone();
+            let view = self.build_view(player_idx);
+            let discards = self.players[player_idx].choose_discards(&view, &hand_clone, 1);
+                self.drain_thinking(player_idx);
+            if let Some(&id) = discards.first() {
+                if let Some(card) = self.state.players[player_idx].take_from_hand(id) {
+                    self.emit(format!(
+                        "{} discards {} to maintain Solar Eclipse on {}.",
+                        self.state.players[player_idx].name, card, sys_name
+                    ));
+                    self.state.deck.push_bottom(card);
+                }
+            }
+        } else {
+            if let Some(omen_id) =
+                self.state.players[player_idx].star_chart.detach_solar_eclipse(star_id)
+            {
+                if let Some(c) = self.state.reconstruct(omen_id) {
+                    self.state.deck.push_bottom(c);
+                }
+                self.emit(format!("{} lets Solar Eclipse on {} lapse.", self.state.players[player_idx].name, sys_name));
+            }
+        }
+    }
+
+    fn run_draw_phase(&mut self, idx: usize) {
+        match self.state.deck.draw() {
+            Some(card) => {
+                self.emit(format!("{} draws a card.", self.state.players[idx].name));
+                self.state.players[idx].hand.push(card);
+            }
+            None => {
+                self.emit("Deck is empty — no card drawn.".into());
+            }
+        }
+    }
+
+    fn run_action_phase(&mut self, idx: usize) -> Option<GameResult> {
+        if self.state.players[idx].skip_next_action {
+            self.state.players[idx].skip_next_action = false;
+            self.emit(format!(
+                "{} skips their Action Phase (Black Hole effect).",
+                self.state.players[idx].name
+            ));
+            return None;
+        }
+
+        loop {
+            if self.state.players[idx].hand.len() < 6 {
+                break;
+            }
+
+            let legal = self.compute_legal_actions(idx);
+            let view = self.build_view(idx);
+            self.notify_thinking(idx);
+            let choice = self.players[idx].choose_action(&view, &legal);
+                self.drain_thinking(idx);
+            let action = legal[choice.min(legal.len() - 1)].clone();
+
+            if matches!(action, Action::Pass) {
+                self.emit(format!("{} passes.", self.state.players[idx].name));
+                self.send_snapshot(None);
+                break;
+            }
+
+            if let Some(result) = self.execute_action(action, idx) {
+                return Some(result);
+            }
+            self.send_snapshot(None);
+        }
+
+        None
+    }
+
+    fn run_end_phase(&mut self, idx: usize) -> Option<GameResult> {
+        // Discard to 5
+        let excess = self.state.players[idx].hand.len().saturating_sub(5);
+        if excess > 0 {
+            let view = self.build_view(idx);
+            let hand_clone = self.state.players[idx].hand.clone();
+            let to_discard = self.players[idx].choose_discards(&view, &hand_clone, excess);
+                self.drain_thinking(idx);
+            for id in to_discard {
+                if let Some(card) = self.state.players[idx].take_from_hand(id) {
+                    self.emit(format!("{} discards {}.", self.state.players[idx].name, card));
+                    self.state.deck.push_bottom(card);
+                }
+            }
+            // Discard any remaining excess (fallback if player returned wrong count)
+            while self.state.players[idx].hand.len() > 5 {
+                let card = self.state.players[idx].hand.pop().unwrap();
+                self.state.deck.push_bottom(card);
+            }
+        }
+
+        // Astronomical Domination victory check
+        let complete = self.state.players[idx].star_chart.complete_systems().len();
+        if complete >= 3 {
+            return Some(GameResult {
+                winner_idx: idx,
+                winner_name: self.state.players[idx].name.clone(),
+                condition: WinCondition::AstronomicalDomination,
+                turns_elapsed: self.state.turn_number,
+            });
+        }
+
+        None
+    }
+
+    // ── Action execution ──────────────────────────────────────────────────────
+
+    fn execute_action(&mut self, action: Action, player_idx: usize) -> Option<GameResult> {
+        match action {
+            Action::Pass => None,
+
+            Action::PlayStar(card_id) => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                let (name, class) = match &card.kind {
+                    CardKind::Star(n) => (*n, n.class()?),
+                    _ => return None,
+                };
+                self.emit(format!(
+                    "{} places {} (Class {}) in Star Chart.",
+                    self.state.players[player_idx].name, name, class
+                ));
+                self.state.players[player_idx].star_chart.place_star(card_id, name, class);
+                None
+            }
+
+            Action::PlayDiscovery { card: card_id, onto_star } => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                let disc_name = match card.kind {
+                    CardKind::Discovery(n) => n,
+                    _ => return None,
+                };
+                let star_name = self.state.players[player_idx]
+                    .star_chart
+                    .system_for_star(onto_star)
+                    .map(|s| s.star_name)?;
+                self.state.players[player_idx]
+                    .star_chart
+                    .attach_discovery(onto_star, card_id, disc_name);
+                self.emit(format!(
+                    "{} attaches {} to {}.",
+                    self.state.players[player_idx].name, disc_name, star_name
+                ));
+                None
+            }
+
+            Action::PlaySolarSystem { star, discoveries } => {
+                let star_card = self.state.players[player_idx].take_from_hand(star)?;
+                let (star_name, class) = match &star_card.kind {
+                    CardKind::Star(n) => (*n, n.class()?),
+                    _ => return None,
+                };
+                self.state.players[player_idx].star_chart.place_star(star, star_name, class);
+                let mut disc_names = Vec::new();
+                for disc_id in &discoveries {
+                    if let Some(card) = self.state.players[player_idx].take_from_hand(*disc_id) {
+                        if let CardKind::Discovery(dn) = card.kind {
+                            self.state.players[player_idx]
+                                .star_chart
+                                .attach_discovery(star, *disc_id, dn);
+                            disc_names.push(dn.to_string());
+                        }
+                    }
+                }
+                self.emit(format!(
+                    "{} completes a Solar System: {} with [{}].",
+                    self.state.players[player_idx].name,
+                    star_name,
+                    disc_names.join(", ")
+                ));
+                None
+            }
+
+            Action::PlayOmen { card: card_id, attachment } => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                let link = ChainLink::new(card, player_idx, vec![]);
+                let mut chain = Chain::new(link);
+                self.run_chain_responses(&mut chain, player_idx);
+                // Resolve LIFO; omens attach on resolution
+                self.resolve_chain_omens(chain, player_idx, &attachment)
+            }
+
+            Action::PlayFlare(card_id) => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                let link = ChainLink::new(card, player_idx, vec![]);
+                let mut chain = Chain::new(link);
+                self.run_chain_responses(&mut chain, player_idx);
+                self.resolve_chain(chain)
+            }
+
+            Action::PlayFracture(card_id) => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                let link = ChainLink::new(card, player_idx, vec![]);
+                let mut chain = Chain::new(link);
+                self.run_chain_responses(&mut chain, player_idx);
+                self.resolve_chain(chain)
+            }
+
+            Action::PlaySupernovas { fusion, gravity, gas } => {
+                let fc = self.state.players[player_idx].take_from_hand(fusion)?;
+                let gc = self.state.players[player_idx].take_from_hand(gravity)?;
+                let gac = self.state.players[player_idx].take_from_hand(gas)?;
+                self.emit(format!(
+                    "{} plays all three Supernovas — Cosmic Cataclysm attempt!",
+                    self.state.players[player_idx].name
+                ));
+                let mut chain = Chain::new(ChainLink::new(fc, player_idx, vec![]));
+                chain.push(ChainLink::new(gc, player_idx, vec![]));
+                chain.push(ChainLink::new(gac, player_idx, vec![]));
+                // Opponents may respond with Cosmic Denial
+                self.run_chain_responses(&mut chain, player_idx);
+                self.resolve_chain(chain)
+            }
+
+            Action::PlayProtostar { card: card_id, choice } => {
+                let card = self.state.players[player_idx].take_from_hand(card_id)?;
+                self.emit(format!("{} plays Protostar.", self.state.players[player_idx].name));
+                // Protostar shuffles itself back into deck first
+                self.state.deck.shuffle_in(card);
+                self.emit("  Protostar shuffled into deck.".into());
+                match choice {
+                    ProtostarChoice::DrawTwo => {
+                        self.draw_n(player_idx, 2);
+                    }
+                    ProtostarChoice::SearchWhiteDwarf => {
+                        let found = self.state.deck.search_and_remove(|c| {
+                            matches!(&c.kind, CardKind::Star(StarName::WhiteDwarf))
+                        });
+                        if let Some(wd) = found {
+                            let wd_id = wd.id;
+                            self.emit(format!(
+                                "  {} finds White Dwarf — placed directly in Star Chart.",
+                                self.state.players[player_idx].name
+                            ));
+                            self.state.players[player_idx]
+                                .star_chart
+                                .place_star(wd_id, StarName::WhiteDwarf, 3);
+                            self.state.deck.shuffle();
+                        } else {
+                            self.emit("  No White Dwarf in deck — drawing 2 instead.".into());
+                            self.state.deck.shuffle();
+                            self.draw_n(player_idx, 2);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    // ── Chain ─────────────────────────────────────────────────────────────────
+
+    /// Collect reactive responses to an open chain.
+    /// Starts from the player left of `last_adder` and rotates; a full round of passes closes.
+    fn run_chain_responses(&mut self, chain: &mut Chain, last_adder: usize) {
+        let n = self.state.players.len();
+        let mut start = (last_adder + 1) % n;
+        let mut consecutive_passes = 0;
+
+        while consecutive_passes < n {
+            let responder = (start + consecutive_passes) % n;
+            let legal = self.compute_chain_responses(responder, chain);
+
+            if legal.is_empty() {
+                consecutive_passes += 1;
+                continue;
+            }
+
+            let view = self.build_view(responder);
+            let chain_view = ChainView::from(&*chain);
+            self.notify_thinking(responder);
+            let resp = self.players[responder].respond_to_chain(&view, &chain_view, &legal);
+                self.drain_thinking(responder);
+
+            match resp {
+                Some(choice) => {
+                    let chosen = &legal[choice.min(legal.len() - 1)];
+                    if let Some(card) = self.state.players[responder].take_from_hand(chosen.card) {
+                        self.emit(format!(
+                            "  {} responds: {}",
+                            self.state.players[responder].name, card
+                        ));
+                        chain.push(ChainLink::new(card, responder, chosen.targets.clone()));
+                        self.send_snapshot(Some(chain));
+                        start = (responder + 1) % n;
+                        consecutive_passes = 0;
+                    }
+                }
+                None => {
+                    consecutive_passes += 1;
+                }
+            }
+        }
+    }
+
+    /// Resolve a closed chain in LIFO order.
+    fn resolve_chain(&mut self, mut chain: Chain) -> Option<GameResult> {
+        self.emit("Chain resolves (LIFO):".into());
+
+        for raw_idx in chain.resolution_order() {
+            if chain.links[raw_idx].negated {
+                self.emit(format!("  [negated] {}", chain.links[raw_idx].card));
+                continue;
+            }
+
+            let card = chain.links[raw_idx].card.clone();
+            let actor = chain.links[raw_idx].player_idx;
+            self.emit(format!("  Resolving {}", card));
+
+            // Cosmic Denial handled here to allow mutating chain
+            if matches!(&card.kind, CardKind::Flare(FlareName::CosmicDenial)) {
+                // Only deniable links that come before this one in the chain (lower indices)
+                let deniable: Vec<usize> = chain
+                    .deniable_links()
+                    .into_iter()
+                    .filter(|&i| i < raw_idx)
+                    .collect();
+                if deniable.is_empty() {
+                    self.emit("  Cosmic Denial: no valid targets.".into());
+                } else {
+                    let opts: Vec<String> = deniable
+                        .iter()
+                        .map(|&i| format!("CL{}: {}", i + 1, chain.links[i].card))
+                        .collect();
+                    let view = self.build_view(actor);
+                    let req = ChoiceRequest {
+                        prompt: "Cosmic Denial: choose a Flare or Fracture to negate.".into(),
+                        options: opts,
+                        pick: 1,
+                    };
+                    let choice = self.players[actor].decide(&view, &req);
+                self.drain_thinking(actor);
+                    let target = deniable[choice.min(deniable.len() - 1)];
+                    chain.negate(target);
+                    let negated_card_name = chain.links[target].card.to_string();
+                    self.emit(format!(
+                        "  Cosmic Denial negates CL{}: {}",
+                        target + 1,
+                        negated_card_name
+                    ));
+                }
+                continue;
+            }
+
+            // Omen links that are reactive: attach them
+            if let CardKind::Omen(omen_name) = &card.kind {
+                let omen_name = *omen_name;
+                let omen_id = card.id;
+                // The chain link should carry attachment info in targets, but for now
+                // we ask the acting player where they want to attach
+                self.attach_reactive_omen(omen_id, omen_name, actor);
+                continue;
+            }
+
+            // Regular Flare / Fracture effects
+            if let Some(result) = self.apply_card_effect(card, actor) {
+                self.flush_chain(chain);
+                return Some(result);
+            }
+        }
+
+        // Cosmic Cataclysm check (Supernovas win after full resolution)
+        if chain.has_winning_supernovas() {
+            let winner_idx = chain
+                .links
+                .iter()
+                .find(|l| l.card.is_supernova() && !l.negated)
+                .map(|l| l.player_idx)
+                .unwrap_or(self.state.active_player_idx);
+            self.flush_chain(chain);
+            self.emit(format!(
+                "{} wins via Cosmic Cataclysm!",
+                self.state.players[winner_idx].name
+            ));
+            return Some(GameResult {
+                winner_idx,
+                winner_name: self.state.players[winner_idx].name.clone(),
+                condition: WinCondition::CosmicCataclysm,
+                turns_elapsed: self.state.turn_number,
+            });
+        }
+
+        self.flush_chain(chain);
+        None
+    }
+
+    /// Resolve a chain that was opened by an Omen play (the caster's omen attaches on resolution).
+    fn resolve_chain_omens(
+        &mut self,
+        mut chain: Chain,
+        caster_idx: usize,
+        attachment: &OmenAttachment,
+    ) -> Option<GameResult> {
+        self.emit("Chain resolves (LIFO):".into());
+
+        for raw_idx in chain.resolution_order() {
+            if chain.links[raw_idx].negated {
+                self.emit(format!("  [negated] {}", chain.links[raw_idx].card));
+                // Negated omen — put on deck
+                let oid = chain.links[raw_idx].card.id;
+                if let Some(c) = self.state.reconstruct(oid) {
+                    self.state.deck.push_bottom(c);
+                }
+                continue;
+            }
+
+            let card = chain.links[raw_idx].card.clone();
+            let actor = chain.links[raw_idx].player_idx;
+
+            if actor == caster_idx && matches!(card.kind, CardKind::Omen(_)) {
+                self.emit(format!("  {} attaches.", card));
+                self.apply_omen_attachment(card.id, actor, attachment);
+                continue;
+            }
+
+            if matches!(&card.kind, CardKind::Omen(_)) {
+                let omen_name = match card.kind { CardKind::Omen(n) => n, _ => unreachable!() };
+                self.attach_reactive_omen(card.id, omen_name, actor);
+                continue;
+            }
+
+            if matches!(&card.kind, CardKind::Flare(FlareName::CosmicDenial)) {
+                let deniable: Vec<usize> = chain
+                    .deniable_links()
+                    .into_iter()
+                    .filter(|&i| i < raw_idx)
+                    .collect();
+                if !deniable.is_empty() {
+                    let opts: Vec<String> = deniable
+                        .iter()
+                        .map(|&i| format!("CL{}: {}", i + 1, chain.links[i].card))
+                        .collect();
+                    let view = self.build_view(actor);
+                    let req = ChoiceRequest {
+                        prompt: "Cosmic Denial: choose a target to negate.".into(),
+                        options: opts,
+                        pick: 1,
+                    };
+                    let choice = self.players[actor].decide(&view, &req);
+                self.drain_thinking(actor);
+                    chain.negate(deniable[choice.min(deniable.len() - 1)]);
+                }
+                continue;
+            }
+
+            if let Some(result) = self.apply_card_effect(card, actor) {
+                self.flush_chain(chain);
+                return Some(result);
+            }
+        }
+
+        self.flush_chain(chain);
+        None
+    }
+
+    fn apply_omen_attachment(&mut self, omen_id: CardId, player_idx: usize, attachment: &OmenAttachment) {
+        match attachment {
+            OmenAttachment::SolarEclipse { system_star } => {
+                if self.state.players[player_idx]
+                    .star_chart
+                    .attach_solar_eclipse(*system_star, omen_id)
+                {
+                    let name = self.state.players[player_idx]
+                        .star_chart
+                        .system_for_star(*system_star)
+                        .map(|s| s.star_name.to_string())
+                        .unwrap_or_default();
+                    self.emit(format!(
+                        "{}'s Solar Eclipse protects {}.",
+                        self.state.players[player_idx].name, name
+                    ));
+                } else {
+                    // No valid target — return to deck
+                    if let Some(c) = self.state.reconstruct(omen_id) {
+                        self.state.deck.push_bottom(c);
+                    }
+                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                }
+            }
+            OmenAttachment::PlanetOfLife { rocky_planet_disc } => {
+                if self.state.players[player_idx]
+                    .star_chart
+                    .attach_planet_of_life(*rocky_planet_disc, omen_id)
+                {
+                    self.emit(format!(
+                        "{} attaches Planet of Life to a Rocky Planet.",
+                        self.state.players[player_idx].name
+                    ));
+                } else {
+                    if let Some(c) = self.state.reconstruct(omen_id) {
+                        self.state.deck.push_bottom(c);
+                    }
+                    self.emit("Planet of Life: no valid target — returned to deck.".into());
+                }
+            }
+        }
+    }
+
+    fn attach_reactive_omen(&mut self, omen_id: CardId, omen_name: OmenName, player_idx: usize) {
+        let attachment = match omen_name {
+            OmenName::SolarEclipse => {
+                // Ask player which completed system to attach to
+                let stars: Vec<CardId> = self.state.players[player_idx]
+                    .star_chart
+                    .complete_systems()
+                    .iter()
+                    .filter(|s| s.eclipse_id.is_none())
+                    .map(|s| s.star_id)
+                    .collect();
+                if stars.is_empty() {
+                    if let Some(c) = self.state.reconstruct(omen_id) {
+                        self.state.deck.push_bottom(c);
+                    }
+                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                    return;
+                }
+                let opts: Vec<String> = stars
+                    .iter()
+                    .filter_map(|&sid| {
+                        self.state.players[player_idx]
+                            .star_chart
+                            .system_for_star(sid)
+                            .map(|s| s.star_name.to_string())
+                    })
+                    .collect();
+                let view = self.build_view(player_idx);
+                let req = ChoiceRequest {
+                    prompt: "Solar Eclipse: attach to which completed system?".into(),
+                    options: opts,
+                    pick: 1,
+                };
+                let choice = self.players[player_idx].decide(&view, &req);
+                self.drain_thinking(player_idx);
+                OmenAttachment::SolarEclipse { system_star: stars[choice.min(stars.len() - 1)] }
+            }
+            OmenName::PlanetOfLife => {
+                let rockies: Vec<CardId> = self.state.players[player_idx]
+                    .star_chart
+                    .systems
+                    .iter()
+                    .flat_map(|s| s.rocky_planets())
+                    .collect();
+                if rockies.is_empty() {
+                    if let Some(c) = self.state.reconstruct(omen_id) {
+                        self.state.deck.push_bottom(c);
+                    }
+                    self.emit("Planet of Life: no Rocky Planet to attach to.".into());
+                    return;
+                }
+                let view = self.build_view(player_idx);
+                let req = ChoiceRequest {
+                    prompt: "Planet of Life: attach to which Rocky Planet?".into(),
+                    options: (0..rockies.len()).map(|i| format!("Rocky Planet #{}", i + 1)).collect(),
+                    pick: 1,
+                };
+                let choice = self.players[player_idx].decide(&view, &req);
+                self.drain_thinking(player_idx);
+                OmenAttachment::PlanetOfLife {
+                    rocky_planet_disc: rockies[choice.min(rockies.len() - 1)],
+                }
+            }
+        };
+        self.apply_omen_attachment(omen_id, player_idx, &attachment);
+    }
+
+    fn flush_chain(&mut self, chain: Chain) {
+        for link in chain.links {
+            // Attached omens are already tracked in star charts — only flush non-omen cards
+            if !matches!(link.card.kind, CardKind::Omen(_)) {
+                self.state.deck.push_bottom(link.card);
+            }
+            // Negated omens were already pushed to deck in resolve_chain_omens
+        }
+    }
+
+    // ── Card effect resolution ────────────────────────────────────────────────
+
+    fn apply_card_effect(&mut self, card: Card, actor: usize) -> Option<GameResult> {
+        match card.kind {
+            CardKind::Flare(f) => self.apply_flare(f, actor),
+            CardKind::Fracture(f) => self.apply_fracture(f, actor),
+            _ => None,
+        }
+    }
+
+    fn apply_flare(&mut self, flare: FlareName, actor: usize) -> Option<GameResult> {
+        match flare {
+            FlareName::StellarAlignment => {
+                self.emit(format!("{} Stellar Alignment — draw 2.", self.state.players[actor].name));
+                self.draw_n(actor, 2);
+                self.state.stellar_alignment_this_turn = true;
+                None
+            }
+
+            FlareName::CosmicDenial => {
+                // Handled specially in resolve_chain; shouldn't reach here
+                None
+            }
+
+            FlareName::Wormhole => {
+                let opponents = self.opponent_indices(actor);
+                if opponents.is_empty() {
+                    return None;
+                }
+                let view = self.build_view(actor);
+                let mode = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Wormhole — choose mode:".into(),
+                        options: vec![
+                            "Take 1 card blindly from an opponent's hand".into(),
+                            "Take up to 2 Star/Discovery cards from an opponent's Star Chart".into(),
+                        ],
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+
+                let opp_opts: Vec<String> =
+                    opponents.iter().map(|&i| self.state.players[i].name.clone()).collect();
+                let view = self.build_view(actor);
+                let opp_choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Choose target opponent:".into(),
+                        options: opp_opts,
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let target = opponents[opp_choice.min(opponents.len() - 1)];
+
+                if mode == 0 {
+                    self.wormhole_blind_steal(actor, target);
+                } else {
+                    self.wormhole_chart_steal(actor, target);
+                }
+                None
+            }
+
+            FlareName::Ignition => {
+                let view = self.build_view(actor);
+                let mode = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Ignition — choose mode:".into(),
+                        options: vec![
+                            "Destroy a Gas Giant in an opponent's Star Chart, then search for Yellow Dwarf".into(),
+                            "Target opponent reveals hand; if they hold a Gas Giant, put it on bottom of deck, then search for Yellow Dwarf".into(),
+                        ],
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+
+                let opponents = self.opponent_indices(actor);
+                let opp_opts: Vec<String> =
+                    opponents.iter().map(|&i| self.state.players[i].name.clone()).collect();
+                let view = self.build_view(actor);
+                let opp_choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Choose target opponent:".into(),
+                        options: opp_opts,
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let target = opponents[opp_choice.min(opponents.len() - 1)];
+
+                if mode == 0 {
+                    if let Some((gid, star_name)) =
+                        self.state.players[target].star_chart.take_gas_giant(false)
+                    {
+                        if let Some(c) = self.state.reconstruct(gid) {
+                            self.emit(format!(
+                                "Ignition destroys Gas Giant from {}'s {} system.",
+                                self.state.players[target].name, star_name
+                            ));
+                            self.state.deck.push_bottom(c);
+                        }
+                    } else {
+                        self.emit("Ignition: no Gas Giant in target's Star Chart.".into());
+                    }
+                } else {
+                    self.emit(format!(
+                        "Ignition: {} reveals hand.",
+                        self.state.players[target].name
+                    ));
+                    let gas_id = self.state.players[target]
+                        .hand
+                        .iter()
+                        .find(|c| matches!(&c.kind, CardKind::Discovery(DiscoveryName::GasGiant)))
+                        .map(|c| c.id);
+                    if let Some(gid) = gas_id {
+                        if let Some(card) = self.state.players[target].take_from_hand(gid) {
+                            self.emit(format!(
+                                "Ignition puts Gas Giant from {}'s hand on bottom of deck.",
+                                self.state.players[target].name
+                            ));
+                            self.state.deck.push_bottom(card);
+                        }
+                    } else {
+                        self.emit("Ignition: no Gas Giant in target's hand.".into());
+                    }
+                }
+
+                // Both modes: search for Yellow Dwarf
+                let yd = self.state.deck.search_and_remove(|c| {
+                    matches!(&c.kind, CardKind::Star(StarName::YellowDwarf))
+                });
+                match yd {
+                    Some(card) => {
+                        self.emit(format!(
+                            "{} finds Yellow Dwarf via Ignition.",
+                            self.state.players[actor].name
+                        ));
+                        self.state.players[actor].hand.push(card);
+                    }
+                    None => {
+                        self.emit("No Yellow Dwarf in deck.".into());
+                    }
+                }
+                self.state.deck.shuffle();
+                None
+            }
+
+            FlareName::AstralProjection => {
+                let opponents = self.opponent_indices(actor);
+                let opp_opts: Vec<String> =
+                    opponents.iter().map(|&i| self.state.players[i].name.clone()).collect();
+                let view = self.build_view(actor);
+                let choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Astral Projection: choose target opponent.".into(),
+                        options: opp_opts,
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let target = opponents[choice.min(opponents.len() - 1)];
+                self.state.players[target].astral_projected_turns = 2;
+                self.emit(format!(
+                    "{} Astral Projection on {} — hand revealed for 2 of their turns.",
+                    self.state.players[actor].name, self.state.players[target].name
+                ));
+                None
+            }
+
+            FlareName::SupernovaFusion
+            | FlareName::SupernovaGravity
+            | FlareName::SupernovaGas => {
+                // Win check happens after full chain resolution in resolve_chain
+                None
+            }
+        }
+    }
+
+    fn apply_fracture(&mut self, frac: FractureName, actor: usize) -> Option<GameResult> {
+        match frac {
+            FractureName::BlackHole => {
+                self.emit(format!(
+                    "{} Black Hole — everyone shuffles hand and field into deck!",
+                    self.state.players[actor].name
+                ));
+                let n = self.state.players.len();
+                for i in 0..n {
+                    // Collect hand
+                    let hand: Vec<Card> = self.state.players[i].hand.drain(..).collect();
+                    // Collect star/discovery cards (Omens survive per rules)
+                    let wipe = self.state.players[i].star_chart.drain_for_board_wipe();
+                    let field_cards: Vec<Card> = wipe
+                        .to_deck
+                        .iter()
+                        .filter_map(|&id| self.state.reconstruct(id))
+                        .collect();
+
+                    self.state.deck.shuffle_in_many(hand);
+                    self.state.deck.shuffle_in_many(field_cards);
+                    // floating_eclipse_ids are already tracked in star_chart.floating_omens
+                }
+                // Caster skips next Action Phase
+                self.state.players[actor].skip_next_action = true;
+                self.state.deck.shuffle();
+                None
+            }
+
+            FractureName::Athena => {
+                let opponents = self.opponent_indices(actor);
+                let opp_opts: Vec<String> =
+                    opponents.iter().map(|&i| self.state.players[i].name.clone()).collect();
+                let view = self.build_view(actor);
+                let mode = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Athena — choose mode:".into(),
+                        options: vec![
+                            "Destroy a Discovery in an opponent's Star Chart".into(),
+                            "Return a Gas Giant from an opponent's Star Chart to their hand".into(),
+                        ],
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let view = self.build_view(actor);
+                let opp_choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Choose target opponent:".into(),
+                        options: opp_opts,
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let target = opponents[opp_choice.min(opponents.len() - 1)];
+
+                if mode == 0 {
+                    let opts = self.disc_target_options(target);
+                    if opts.is_empty() {
+                        self.emit(format!(
+                            "Athena: {} has no valid Discovery targets.",
+                            self.state.players[target].name
+                        ));
+                        return None;
+                    }
+                    let view = self.build_view(actor);
+                    let picks = self.players[actor].pick_targets(
+                        &view,
+                        "Choose a Discovery to destroy:",
+                        &opts,
+                        1,
+                    );
+                self.drain_thinking(actor);
+                    if let Some(&pick) = picks.first() {
+                        let pick = pick.min(opts.len() - 1);
+                        if let Target::StarChartCard { card_id, .. } = opts[pick].target.clone() {
+                            if let Some((_sn, dn)) = self.state.players[target]
+                                .star_chart
+                                .remove_discovery(card_id, false)
+                            {
+                                if let Some(c) = self.state.reconstruct(card_id) {
+                                    self.emit(format!(
+                                        "Athena destroys {} from {}'s Star Chart.",
+                                        dn, self.state.players[target].name
+                                    ));
+                                    self.state.deck.push_bottom(c);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if let Some((gid, sn)) =
+                        self.state.players[target].star_chart.take_gas_giant(false)
+                    {
+                        if let Some(c) = self.state.reconstruct(gid) {
+                            self.emit(format!(
+                                "Athena returns Gas Giant from {}'s {} system to their hand.",
+                                self.state.players[target].name, sn
+                            ));
+                            self.state.players[target].hand.push(c);
+                        }
+                    } else {
+                        self.emit("Athena: no Gas Giant in target's Star Chart.".into());
+                    }
+                }
+                None
+            }
+
+            FractureName::Pulsar => {
+                self.emit(format!(
+                    "{} Pulsar — shuffles own hand and field into deck, draws up to 7.",
+                    self.state.players[actor].name
+                ));
+                let hand: Vec<Card> = self.state.players[actor].hand.drain(..).collect();
+                let wipe = self.state.players[actor].star_chart.drain_for_board_wipe();
+                let field_cards: Vec<Card> = wipe
+                    .to_deck
+                    .iter()
+                    .filter_map(|&id| self.state.reconstruct(id))
+                    .collect();
+                self.state.deck.shuffle_in_many(hand);
+                self.state.deck.shuffle_in_many(field_cards);
+                self.state.deck.shuffle();
+                self.draw_n(actor, 7);
+                None
+            }
+
+            FractureName::DarkMatterVoid => {
+                let view = self.build_view(actor);
+                let choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Dark Matter Void: choose a Star Class to restrict for opponents.".into(),
+                        options: vec![
+                            "Class 2 (Red Dwarf / Brown Dwarf)".into(),
+                            "Class 3 (White Dwarf)".into(),
+                            "Class 4 (Yellow Dwarf)".into(),
+                            "Class 5 (Red Giant)".into(),
+                            "Class 6 (Red Supergiant)".into(),
+                        ],
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let restricted_class = (choice.min(4) as u8) + 2;
+                self.emit(format!(
+                    "{} Dark Matter Void — Class {} Stars locked for opponents until {}'s next turn.",
+                    self.state.players[actor].name,
+                    restricted_class,
+                    self.state.players[actor].name
+                ));
+                self.state.dark_matter_void = Some(DarkMatterVoid { restricted_class, caster_idx: actor });
+                None
+            }
+
+            FractureName::QuantumEntanglementFailure => {
+                let n = self.state.players.len();
+                let all_opts: Vec<String> =
+                    (0..n).map(|i| self.state.players[i].name.clone()).collect();
+
+                let view = self.build_view(actor);
+                let p1 = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "QEF: choose first player.".into(),
+                        options: all_opts.clone(),
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let p1 = p1.min(n - 1);
+
+                let remaining_opts: Vec<(usize, String)> = (0..n)
+                    .filter(|&i| i != p1)
+                    .map(|i| (i, self.state.players[i].name.clone()))
+                    .collect();
+                let view = self.build_view(actor);
+                let p2_local = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "QEF: choose second player.".into(),
+                        options: remaining_opts.iter().map(|(_, n)| n.clone()).collect(),
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let p2 = remaining_opts[p2_local.min(remaining_opts.len() - 1)].0;
+
+                let pick1 = if !self.state.players[p1].hand.is_empty() {
+                    let view = self.build_view(p1);
+                    let opts: Vec<String> =
+                        self.state.players[p1].hand.iter().map(|c| c.to_string()).collect();
+                    let c = self.players[p1].decide(
+                        &view,
+                        &ChoiceRequest {
+                            prompt: format!(
+                                "{}: secretly choose a card to swap.",
+                                self.state.players[p1].name
+                            ),
+                            options: opts,
+                            pick: 1,
+                        },
+                    );
+                self.drain_thinking(p1);
+                    Some(self.state.players[p1].hand[c.min(self.state.players[p1].hand.len() - 1)].id)
+                } else {
+                    None
+                };
+
+                let pick2 = if !self.state.players[p2].hand.is_empty() {
+                    let view = self.build_view(p2);
+                    let opts: Vec<String> =
+                        self.state.players[p2].hand.iter().map(|c| c.to_string()).collect();
+                    let c = self.players[p2].decide(
+                        &view,
+                        &ChoiceRequest {
+                            prompt: format!(
+                                "{}: secretly choose a card to swap.",
+                                self.state.players[p2].name
+                            ),
+                            options: opts,
+                            pick: 1,
+                        },
+                    );
+                self.drain_thinking(p2);
+                    Some(self.state.players[p2].hand[c.min(self.state.players[p2].hand.len() - 1)].id)
+                } else {
+                    None
+                };
+
+                if let (Some(id1), Some(id2)) = (pick1, pick2) {
+                    let c1 = self.state.players[p1].take_from_hand(id1);
+                    let c2 = self.state.players[p2].take_from_hand(id2);
+                    if let (Some(c1), Some(c2)) = (c1, c2) {
+                        self.emit(format!(
+                            "QEF: {} and {} swap cards.",
+                            self.state.players[p1].name, self.state.players[p2].name
+                        ));
+                        self.state.players[p1].hand.push(c2);
+                        self.state.players[p2].hand.push(c1);
+                    }
+                } else {
+                    self.emit("QEF: one or both players have no cards — no swap.".into());
+                }
+                None
+            }
+
+            FractureName::StellarNurseryCollapse => {
+                self.emit(format!(
+                    "{} Stellar Nursery Collapse — shuffles deck, privately views top 5.",
+                    self.state.players[actor].name
+                ));
+                self.state.deck.shuffle();
+                let top5: Vec<Card> = self.state.deck.peek_top(5).to_vec();
+                let n = top5.len();
+                if n == 0 {
+                    return None;
+                }
+                // Player picks the order to place them on the bottom
+                // Simplified: player makes n sequential picks to specify order
+                let mut ordered_ids: Vec<CardId> = Vec::with_capacity(n);
+                let mut remaining: Vec<(usize, &Card)> = top5.iter().enumerate().collect();
+                for pick_num in 0..n {
+                    let view = self.build_view(actor);
+                    let opts: Vec<String> = remaining.iter().map(|(_, c)| c.to_string()).collect();
+                    let choice = self.players[actor].decide(
+                        &view,
+                        &ChoiceRequest {
+                            prompt: format!(
+                                "Stellar Nursery Collapse: pick card #{} to place at the bottom (first pick = deepest).",
+                                pick_num + 1
+                            ),
+                            options: opts,
+                            pick: 1,
+                        },
+                    );
+                self.drain_thinking(actor);
+                    let picked = remaining.remove(choice.min(remaining.len() - 1));
+                    ordered_ids.push(picked.1.id);
+                }
+                self.state.deck.nursery_collapse(ordered_ids);
+                None
+            }
+
+            FractureName::Shockwave => {
+                let view = self.build_view(actor);
+                let choice = self.players[actor].decide(
+                    &view,
+                    &ChoiceRequest {
+                        prompt: "Shockwave: which Supernova to search?".into(),
+                        options: vec![
+                            "Supernova - Fusion".into(),
+                            "Supernova - Gravity".into(),
+                            "Supernova - Gas".into(),
+                        ],
+                        pick: 1,
+                    },
+                );
+                self.drain_thinking(actor);
+                let target_flare = match choice.min(2) {
+                    0 => FlareName::SupernovaFusion,
+                    1 => FlareName::SupernovaGravity,
+                    _ => FlareName::SupernovaGas,
+                };
+                let found = self.state.deck.search_and_remove(|c| {
+                    matches!(&c.kind, CardKind::Flare(f) if *f == target_flare)
+                });
+                match found {
+                    Some(card) => {
+                        self.emit(format!(
+                            "{} Shockwave finds {}.",
+                            self.state.players[actor].name, card
+                        ));
+                        self.state.players[actor].hand.push(card);
+                    }
+                    None => {
+                        self.emit("Shockwave: Supernova not found in deck.".into());
+                    }
+                }
+                self.state.deck.shuffle();
+                None
+            }
+        }
+    }
+
+    // ── Wormhole helpers ──────────────────────────────────────────────────────
+
+    fn wormhole_blind_steal(&mut self, actor: usize, target: usize) {
+        if self.state.players[target].hand.is_empty() {
+            self.emit(format!("Wormhole: {} has no cards.", self.state.players[target].name));
+            return;
+        }
+        let pos = (rand::random::<usize>()) % self.state.players[target].hand.len();
+        let stolen = self.state.players[target].hand.remove(pos);
+        self.emit(format!(
+            "{} blindly steals a card from {}.",
+            self.state.players[actor].name, self.state.players[target].name
+        ));
+        self.state.players[actor].hand.push(stolen);
+    }
+
+    fn wormhole_chart_steal(&mut self, actor: usize, target: usize) {
+        let opts = self.chart_target_options(target, false);
+        if opts.is_empty() {
+            self.emit(format!(
+                "Wormhole: {}'s Star Chart has no valid targets.",
+                self.state.players[target].name
+            ));
+            return;
+        }
+        let view = self.build_view(actor);
+        let picks = self.players[actor].pick_targets(
+            &view,
+            "Wormhole: choose up to 2 Star or Discovery cards to take (Wormhole host rules apply).",
+            &opts,
+            2,
+        );
+                self.drain_thinking(actor);
+        let picked_targets: Vec<Target> = picks
+            .iter()
+            .filter_map(|&i| opts.get(i.min(opts.len() - 1)).map(|o| o.target.clone()))
+            .collect();
+
+        for t in picked_targets {
+            if let Target::StarChartCard { card_id, player_idx: tidx } = t {
+                // Attempt to take as a discovery
+                if let Some((_sn, dn)) =
+                    self.state.players[tidx].star_chart.remove_discovery(card_id, false)
+                {
+                    // Try to attach to an incomplete system; otherwise add to hand
+                    let inc_star = self.state.players[actor]
+                        .star_chart
+                        .incomplete_systems()
+                        .first()
+                        .map(|s| s.star_id);
+                    match inc_star {
+                        Some(sid) => {
+                            self.state.players[actor]
+                                .star_chart
+                                .attach_discovery(sid, card_id, dn);
+                            self.emit(format!(
+                                "Wormhole: {} takes {} — attached to existing system.",
+                                self.state.players[actor].name, dn
+                            ));
+                        }
+                        None => {
+                            if let Some(c) = self.state.reconstruct(card_id) {
+                                self.state.players[actor].hand.push(c);
+                                self.emit(format!(
+                                    "Wormhole: {} takes {} — added to hand.",
+                                    self.state.players[actor].name, dn
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Note: taking Stars requires all attached discoveries come with it;
+                // full validation is deferred to the player's pick logic.
+            }
+        }
+    }
+
+    // ── Legal action computation ──────────────────────────────────────────────
+
+    pub fn compute_legal_actions(&self, player_idx: usize) -> Vec<Action> {
+        let mut actions = vec![Action::Pass];
+        let p = &self.state.players[player_idx];
+
+        if p.hand.len() < 6 {
+            return actions;
+        }
+
+        // Dark Matter Void restricted class (does not apply to the caster)
+        let restricted: Option<u8> = self.state.dark_matter_void.as_ref().filter(|d| d.caster_idx != player_idx).map(|d| d.restricted_class);
+
+        // Supernova trio
+        let has_f = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaFusion)));
+        let has_g = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGravity)));
+        let has_s = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGas)));
+        if has_f && has_g && has_s {
+            let fid = p.hand.iter().find(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaFusion))).unwrap().id;
+            let gid = p.hand.iter().find(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGravity))).unwrap().id;
+            let sid = p.hand.iter().find(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGas))).unwrap().id;
+            actions.push(Action::PlaySupernovas { fusion: fid, gravity: gid, gas: sid });
+        }
+
+        for card in &p.hand {
+            match &card.kind {
+                CardKind::Star(StarName::Protostar) => {
+                    actions.push(Action::PlayProtostar { card: card.id, choice: ProtostarChoice::DrawTwo });
+                    actions.push(Action::PlayProtostar { card: card.id, choice: ProtostarChoice::SearchWhiteDwarf });
+                }
+                CardKind::Star(name) => {
+                    if let Some(class) = name.class() {
+                        if restricted.map_or(true, |r| r != class) {
+                            actions.push(Action::PlayStar(card.id));
+                        }
+                    }
+                }
+                CardKind::Discovery(_) => {
+                    for sys in p.star_chart.incomplete_systems() {
+                        actions.push(Action::PlayDiscovery { card: card.id, onto_star: sys.star_id });
+                    }
+                }
+                CardKind::Flare(f) if f.is_supernova() => { /* only as trio */ }
+                CardKind::Flare(FlareName::StellarAlignment) if self.state.stellar_alignment_this_turn => { /* one per turn */ }
+                CardKind::Flare(_) => {
+                    actions.push(Action::PlayFlare(card.id));
+                }
+                CardKind::Omen(OmenName::SolarEclipse) => {
+                    for sys in p.star_chart.complete_systems() {
+                        if sys.eclipse_id.is_none() {
+                            actions.push(Action::PlayOmen {
+                                card: card.id,
+                                attachment: OmenAttachment::SolarEclipse { system_star: sys.star_id },
+                            });
+                        }
+                    }
+                }
+                CardKind::Omen(OmenName::PlanetOfLife) => {
+                    for sys in &p.star_chart.systems {
+                        for rocky_id in sys.rocky_planets() {
+                            // Find if this rocky planet already has a Planet of Life
+                            let already_attached = sys.discoveries.iter()
+                                .any(|d| d.card_id == rocky_id && d.planet_of_life_id.is_some());
+                            if !already_attached {
+                                actions.push(Action::PlayOmen {
+                                    card: card.id,
+                                    attachment: OmenAttachment::PlanetOfLife { rocky_planet_disc: rocky_id },
+                                });
+                            }
+                        }
+                    }
+                }
+                CardKind::Fracture(_) => {
+                    actions.push(Action::PlayFracture(card.id));
+                }
+            }
+        }
+
+        // Complete Solar System plays
+        self.enumerate_solar_system_actions(player_idx, restricted, &mut actions);
+
+        actions
+    }
+
+    fn enumerate_solar_system_actions(
+        &self,
+        player_idx: usize,
+        restricted: Option<u8>,
+        actions: &mut Vec<Action>,
+    ) {
+        let p = &self.state.players[player_idx];
+        let stars: Vec<&Card> = p.hand.iter().filter(|c| {
+            matches!(&c.kind, CardKind::Star(n) if n.class().is_some() && *n != StarName::Protostar)
+                && !matches!(&c.kind, CardKind::Star(StarName::Protostar))
+        }).collect();
+
+        let disc_ids: Vec<CardId> = p
+            .hand
+            .iter()
+            .filter(|c| matches!(&c.kind, CardKind::Discovery(_)))
+            .map(|c| c.id)
+            .collect();
+
+        for star in stars {
+            let class = match star.star_class() { Some(c) => c, None => continue };
+            if restricted.map_or(false, |r| r == class) { continue; }
+            if disc_ids.len() < class as usize { continue; }
+
+            for combo in combinations(&disc_ids, class as usize) {
+                actions.push(Action::PlaySolarSystem { star: star.id, discoveries: combo });
+            }
+        }
+    }
+
+    fn compute_chain_responses(&self, player_idx: usize, chain: &Chain) -> Vec<ChainAction> {
+        let p = &self.state.players[player_idx];
+        let mut responses = Vec::new();
+
+        for card in &p.hand {
+            if !card.kind.can_enter_chain() { continue; }
+            if card.is_supernova() { continue; }
+            if matches!(&card.kind, CardKind::Flare(FlareName::CosmicDenial)) && chain.deniable_links().is_empty() {
+                continue;
+            }
+            responses.push(ChainAction { card: card.id, targets: vec![], omen_attachment: None });
+        }
+
+        responses
+    }
+
+    // ── View building ─────────────────────────────────────────────────────────
+
+    pub fn build_view(&self, for_player: usize) -> GameView {
+        let me = &self.state.players[for_player];
+        let opponents = (0..self.state.players.len())
+            .filter(|&i| i != for_player)
+            .map(|i| {
+                let opp = &self.state.players[i];
+                OpponentView {
+                    idx: i,
+                    name: opp.name.clone(),
+                    hand_size: opp.hand.len(),
+                    hand_revealed: if opp.astral_projected_turns > 0 {
+                        opp.hand.clone()
+                    } else {
+                        vec![]
+                    },
+                    star_chart: opp.star_chart.clone(),
+                }
+            })
+            .collect();
+
+        // Pass recent log so the LLM has narrative context for its decision.
+        let history = {
+            let log = self.log.lock().unwrap();
+            let start = log.len().saturating_sub(30);
+            log[start..].iter()
+                .flat_map(|s| s.split('\n'))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>()
+        };
+
+        GameView {
+            my_idx: for_player,
+            my_name: me.name.clone(),
+            my_hand: me.hand.clone(),
+            my_star_chart: me.star_chart.clone(),
+            opponents,
+            deck_size: self.state.deck.len(),
+            active_player_idx: self.state.active_player_idx,
+            turn_number: self.state.turn_number,
+            dark_matter_void: self.state.dark_matter_void.as_ref().map(|d| d.restricted_class),
+            history,
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn draw_n(&mut self, player_idx: usize, n: usize) {
+        let mut drawn = 0;
+        for _ in 0..n {
+            if let Some(card) = self.state.deck.draw() {
+                self.state.players[player_idx].hand.push(card);
+                drawn += 1;
+            }
+        }
+        if drawn > 0 {
+            self.emit(format!(
+                "  {} draws {}.",
+                self.state.players[player_idx].name, drawn
+            ));
+        }
+    }
+
+    fn opponent_indices(&self, player_idx: usize) -> Vec<usize> {
+        (0..self.state.players.len()).filter(|&i| i != player_idx).collect()
+    }
+
+    fn disc_target_options(&self, player_idx: usize) -> Vec<TargetOption> {
+        let mut opts = Vec::new();
+        for sys in &self.state.players[player_idx].star_chart.systems {
+            if sys.is_eclipse_protected() { continue; }
+            for disc in &sys.discoveries {
+                opts.push(TargetOption::new(
+                    format!("{} (in {} system of {})", disc.name, sys.star_name, self.state.players[player_idx].name),
+                    Target::StarChartCard { player_idx, card_id: disc.card_id },
+                ));
+            }
+        }
+        opts
+    }
+
+    fn chart_target_options(&self, player_idx: usize, bypass_eclipse: bool) -> Vec<TargetOption> {
+        let mut opts = Vec::new();
+        for sys in &self.state.players[player_idx].star_chart.systems {
+            if sys.is_eclipse_protected() && !bypass_eclipse { continue; }
+            opts.push(TargetOption::new(
+                format!("{} [Star]", sys.star_name),
+                Target::StarChartCard { player_idx, card_id: sys.star_id },
+            ));
+            for disc in &sys.discoveries {
+                opts.push(TargetOption::new(
+                    format!("{} [Discovery]", disc.name),
+                    Target::StarChartCard { player_idx, card_id: disc.card_id },
+                ));
+            }
+        }
+        opts
+    }
+
+    fn emit(&mut self, msg: String) {
+        if let Some(tx) = &self.observer {
+            let _ = tx.send(GameEvent::Log(msg.clone()));
+        } else {
+            println!("{}", msg);
+        }
+        self.log.lock().unwrap().push(msg);
+    }
+
+    /// Write the full game log to `./games/<timestamp>_<winner>.log`.
+    /// Creates the directory if it doesn't exist.
+    pub fn save_log(&self, result: &GameResult) -> std::io::Result<()> {
+        use std::fs;
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fs::create_dir_all("games")?;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let winner_slug: String = result.winner_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+
+        let cond = match result.condition {
+            WinCondition::AstronomicalDomination => "astro",
+            WinCondition::CosmicCataclysm => "cataclysm",
+        };
+
+        let path = format!("games/{}_{}_{}turns_{}.log", ts, winner_slug, result.turns_elapsed, cond);
+        let mut file = fs::File::create(&path)?;
+
+        // Header
+        writeln!(file, "NOVACANA — Game Log")?;
+        writeln!(file, "Winner : {} ({})", result.winner_name, cond)?;
+        writeln!(file, "Turns  : {}", result.turns_elapsed)?;
+        writeln!(file, "Players: {}", self.state.players.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))?;
+        writeln!(file, "{}", "─".repeat(60))?;
+
+        for line in self.log.lock().unwrap().iter() {
+            for subline in line.split('\n') {
+                let t = subline.trim();
+                if !t.is_empty() {
+                    writeln!(file, "{}", t)?;
+                }
+            }
+        }
+
+        // Print path so the user knows where it went (suppressed in TUI mode via caller)
+        eprintln!("Game log saved: {}", path);
+        Ok(())
+    }
+}
+
+// ── Combination enumeration ───────────────────────────────────────────────────
+
+fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
+    if k == 0 {
+        return vec![vec![]];
+    }
+    if items.len() < k {
+        return vec![];
+    }
+    let mut result = Vec::new();
+    for i in 0..=(items.len() - k) {
+        for mut combo in combinations(&items[i + 1..], k - 1) {
+            combo.insert(0, items[i].clone());
+            result.push(combo);
+        }
+    }
+    result
+}
