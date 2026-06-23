@@ -245,6 +245,52 @@ pub fn pretrain_policy_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, 
     (optim.step(lr, net, grads), lv)
 }
 
+/// Combined policy CE + value MSE in one backward pass. Trains body + lp + lv jointly.
+/// Mirrors v5's train_step; outperforms sequential value-then-policy because the body
+/// learns representations useful to both heads simultaneously.
+pub fn pretrain_joint_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, B>>(
+    net:      NetV6Burn<B>,
+    optim:    &mut O,
+    lr:       f64,
+    feats:    &[Vec<f32>],
+    masks:    &[u64],
+    actions:  &[u8],
+    outcomes: &[f32],
+    device:   &B::Device,
+) -> (NetV6Burn<B>, f32, f32) {
+    let b = feats.len();
+    assert!(b > 0);
+    let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+    let x = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+
+    let body = body_forward(&net, x);
+
+    // Policy CE
+    let logits = net.lp.forward(body.clone());
+    let mask_flat: Vec<f32> = masks.iter().flat_map(|&m| {
+        (0..NUM_ACTIONS).map(move |i| if m & (1u64 << i) != 0 { 0.0f32 } else { -1e9f32 })
+    }).collect();
+    let mask_t = Tensor::<B, 2>::from_data(TensorData::new(mask_flat, [b, NUM_ACTIONS]), device);
+    let log_p  = activation::log_softmax(logits + mask_t, 1);
+    let act_t  = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(actions.iter().map(|&a| a as i32).collect::<Vec<_>>(), [b, 1]), device,
+    );
+    let policy_loss = -log_p.gather(1, act_t).mean();
+
+    // Value MSE
+    let values     = activation::sigmoid(net.lv.forward(body));
+    let tgt        = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
+    let diff       = values - tgt;
+    let value_loss = (diff.clone() * diff).mean();
+
+    let pl = policy_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let vl = value_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+
+    let total = policy_loss + value_loss;
+    let grads = GradientsParams::from_grads(total.backward(), &net);
+    (optim.step(lr, net, grads), pl, vl)
+}
+
 /// CE loss on candidate head. Trains body + lc1 + lc2.
 /// Used for both imitation pretraining and RL candidate fine-tuning.
 ///

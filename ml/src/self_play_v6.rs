@@ -318,24 +318,30 @@ fn run_one_game_v6(
     temperature:  f32,
     gamma:        f32,
     lambda:       f32,
+    advcpu_share: f32,
 ) -> Vec<RlSampleV6> {
     let use_pool = !pool_nets.is_empty() && rand::random::<f32>() < 0.5;
 
-    let mut bufs:    Vec<Arc<Mutex<Vec<Pending>>>> = Vec::new();
-    let mut players: Vec<Box<dyn Player>>          = Vec::new();
+    let mut bufs:    Vec<Option<Arc<Mutex<Vec<Pending>>>>> = Vec::new();
+    let mut players: Vec<Box<dyn Player>>                  = Vec::new();
 
     for i in 0..num_players {
-        // Always use SelfPlayPlayerV6 so every seat contributes samples.
-        // When using pool, opponents drive their moves with a snapshot net.
-        let net = if use_pool && i != 0 {
-            let idx = rand::random::<usize>() % pool_nets.len();
-            Arc::clone(&pool_nets[idx])
+        // In pool games, opponent seats have advcpu_share chance of being AdvCPU
+        // (no sample collection) to maintain opponent diversity.
+        if use_pool && i != 0 && rand::random::<f32>() < advcpu_share {
+            bufs.push(None);
+            players.push(Box::new(AdvancedCpuPlayer::new(format!("P{}", i + 1))));
         } else {
-            Arc::clone(&current_net)
-        };
-        let (p, buf) = SelfPlayPlayerV6::new(format!("P{}", i + 1), net, temperature);
-        bufs.push(buf);
-        players.push(Box::new(p));
+            let net = if use_pool && i != 0 {
+                let idx = rand::random::<usize>() % pool_nets.len();
+                Arc::clone(&pool_nets[idx])
+            } else {
+                Arc::clone(&current_net)
+            };
+            let (p, buf) = SelfPlayPlayerV6::new(format!("P{}", i + 1), net, temperature);
+            bufs.push(Some(buf));
+            players.push(Box::new(p));
+        }
     }
 
     let mut engine = GameEngine::new(Deck::build_classic(), players);
@@ -344,7 +350,11 @@ fn run_one_game_v6(
     let result = engine.run();
 
     let mut out = Vec::new();
-    for (player_idx, buf) in bufs.into_iter().enumerate() {
+    for (player_idx, buf_opt) in bufs.into_iter().enumerate() {
+        let buf = match buf_opt {
+            Some(b) => b,
+            None => continue,
+        };
         let raw_outcome = if result.winner_idx == player_idx { 1.0f32 } else { 0.0 };
         let pending = Arc::try_unwrap(buf)
             .unwrap_or_else(|b| std::mem::take(&mut *b.lock().unwrap()).into())
@@ -392,6 +402,7 @@ pub fn run_self_play_v6(
     temperature:  f32,
     gamma:        f32,
     lambda:       f32,
+    advcpu_share: f32,
 ) -> Vec<RlSampleV6> {
     assert!((2..=4).contains(&num_players));
 
@@ -409,6 +420,7 @@ pub fn run_self_play_v6(
             temperature,
             gamma,
             lambda,
+            advcpu_share,
         ))
         .collect()
 }

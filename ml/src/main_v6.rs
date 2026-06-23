@@ -39,7 +39,7 @@ use net_v6::{NetV6, WeightsV6, INPUT_DIM};
 use net_v6_burn::{
     NetV6Burn, MAX_CANDS, make_optimizer,
     rl_train_step_burn, cand_step_burn,
-    pretrain_value_step_burn, pretrain_policy_step_burn,
+    pretrain_value_step_burn, pretrain_policy_step_burn, pretrain_joint_step_burn,
 };
 use self_play_v6::{run_self_play_v6, PerBuffer};
 
@@ -545,9 +545,9 @@ fn main() {
     println!("  --games <n>           games to generate [20000]");
     println!("  --players <n>         players per game [4]");
     println!("  --lr <f>              learning rate [0.0003]");
-    println!("  --value-epochs <n>    value head epochs [5]");
-    println!("  --policy-epochs <n>   policy head epochs [5]");
-    println!("  --cand-epochs <n>     candidate head epochs [5]");
+    println!("  --joint-epochs <n>    joint policy+value epochs [30]");
+    println!("  --value-epochs <n>    value fine-tune epochs (lr/2) [10]");
+    println!("  --cand-epochs <n>     candidate head epochs [30]");
     println!("  --batch-size <n>      batch size [512]");
     println!();
     println!("RL options:");
@@ -567,6 +567,7 @@ fn main() {
     println!("  --snapshot-every <n>  iters between snapshots [20]");
     println!("  --pool-cap <n>        max snapshot pool size [10]");
     println!("  --cand-lr-mult <f>    candidate head LR multiplier [3.0]");
+    println!("  --advcpu-share <f>    fraction of pool-game opponent seats using AdvCPU [0.3]");
     println!("  --per-alpha <f>       PER priority exponent [0.6]");
     println!("  --per-beta <f>        PER IS weight exponent start [0.4]");
     println!("  --per-size <n>        PER buffer max size [500000]");
@@ -585,8 +586,8 @@ fn run_pretrain_burn<B: AutodiffBackend>(
     num_games:       usize,
     num_players:     usize,
     lr:              f32,
+    joint_epochs:    usize,
     value_epochs:    usize,
-    policy_epochs:   usize,
     cand_epochs:     usize,
     batch_size:      usize,
     device:          &B::Device,
@@ -610,8 +611,37 @@ fn run_pretrain_burn<B: AutodiffBackend>(
 
     openblas_threads(16);
 
-    // ── Value pretraining ──────────────────────────────────────────────────────
-    println!("Pretraining value ({} epochs, lr={})...", value_epochs, lr);
+    // ── Joint policy+value pretraining ────────────────────────────────────────
+    // Combined CE+MSE in one backward pass; body learns features useful to both
+    // heads simultaneously (mirrors v5's train_step).
+    println!("Pretraining joint policy+value ({} epochs, lr={})...", joint_epochs, lr);
+    for epoch in 0..joint_epochs {
+        let mut idx = policy_idx.clone();
+        idx.shuffle(&mut rng);
+        let mut total_pl = 0.0f64;
+        let mut total_vl = 0.0f64;
+        let mut nb = 0usize;
+        for chunk in idx.chunks(batch_size) {
+            if chunk.len() < 2 { continue; }
+            let feats:    Vec<Vec<f32>> = chunk.iter().map(|&i| samples[i].features.clone()).collect();
+            let masks:    Vec<u64>      = chunk.iter().map(|&i| samples[i].legal_mask).collect();
+            let actions:  Vec<u8>       = chunk.iter().map(|&i| samples[i].action).collect();
+            let outcomes: Vec<f32>      = chunk.iter().map(|&i| samples[i].outcome).collect();
+            let (nn, pl, vl) = pretrain_joint_step_burn(
+                net, &mut opt, lr as f64, &feats, &masks, &actions, &outcomes, device,
+            );
+            net = nn; total_pl += pl as f64; total_vl += vl as f64; nb += 1;
+        }
+        println!("  joint epoch {}/{}: policy_loss={:.4}  value_loss={:.4}",
+            epoch + 1, joint_epochs,
+            total_pl / nb.max(1) as f64, total_vl / nb.max(1) as f64);
+    }
+
+    // ── Value fine-tuning ──────────────────────────────────────────────────────
+    // Additional value-only pass at halved LR to sharpen outcome predictions
+    // without disturbing policy features (mirrors v5's pretrain-value step).
+    let value_lr = (lr * 0.5) as f64;
+    println!("Pretraining value fine-tune ({} epochs, lr={})...", value_epochs, value_lr);
     for epoch in 0..value_epochs {
         let mut indices: Vec<usize> = (0..samples.len()).collect();
         indices.shuffle(&mut rng);
@@ -621,28 +651,10 @@ fn run_pretrain_burn<B: AutodiffBackend>(
             if chunk.len() < 2 { continue; }
             let feats:    Vec<Vec<f32>> = chunk.iter().map(|&i| samples[i].features.clone()).collect();
             let outcomes: Vec<f32>      = chunk.iter().map(|&i| samples[i].outcome).collect();
-            let (nn, loss) = pretrain_value_step_burn(net, &mut opt, lr as f64, &feats, &outcomes, device);
+            let (nn, loss) = pretrain_value_step_burn(net, &mut opt, value_lr, &feats, &outcomes, device);
             net = nn; total_loss += loss as f64; nb += 1;
         }
         println!("  value epoch {}/{}: loss={:.4}", epoch + 1, value_epochs, total_loss / nb.max(1) as f64);
-    }
-
-    // ── Policy pretraining ─────────────────────────────────────────────────────
-    println!("Pretraining policy ({} epochs)...", policy_epochs);
-    for epoch in 0..policy_epochs {
-        let mut idx = policy_idx.clone();
-        idx.shuffle(&mut rng);
-        let mut total_loss = 0.0f64;
-        let mut nb = 0usize;
-        for chunk in idx.chunks(batch_size) {
-            if chunk.len() < 2 { continue; }
-            let feats:   Vec<Vec<f32>> = chunk.iter().map(|&i| samples[i].features.clone()).collect();
-            let masks:   Vec<u64>      = chunk.iter().map(|&i| samples[i].legal_mask).collect();
-            let actions: Vec<u8>       = chunk.iter().map(|&i| samples[i].action).collect();
-            let (nn, loss) = pretrain_policy_step_burn(net, &mut opt, lr as f64, &feats, &masks, &actions, device);
-            net = nn; total_loss += loss as f64; nb += 1;
-        }
-        println!("  policy epoch {}/{}: loss={:.4}", epoch + 1, policy_epochs, total_loss / nb.max(1) as f64);
     }
 
     // ── Candidate pretraining ──────────────────────────────────────────────────
@@ -671,14 +683,14 @@ fn run_pretrain_burn<B: AutodiffBackend>(
 }
 
 fn cmd_pretrain(args: &[String]) {
-    let out_path      = flag_str(args, "--out", "models/astra6_pretrain.bin");
-    let num_games     = flag_usize(args, "--games", 20_000);
-    let num_players   = flag_usize(args, "--players", 4);
-    let lr            = flag_f32(args, "--lr", 0.0003);
-    let value_epochs  = flag_usize(args, "--value-epochs", 5);
-    let policy_epochs = flag_usize(args, "--policy-epochs", 5);
-    let cand_epochs   = flag_usize(args, "--cand-epochs", 5);
-    let batch_size    = flag_usize(args, "--batch-size", 512);
+    let out_path     = flag_str(args, "--out", "models/astra6_pretrain.bin");
+    let num_games    = flag_usize(args, "--games", 20_000);
+    let num_players  = flag_usize(args, "--players", 4);
+    let lr           = flag_f32(args, "--lr", 0.0003);
+    let joint_epochs = flag_usize(args, "--joint-epochs", 30);
+    let value_epochs = flag_usize(args, "--value-epochs", 10);
+    let cand_epochs  = flag_usize(args, "--cand-epochs", 30);
+    let batch_size   = flag_usize(args, "--batch-size", 512);
 
     std::fs::create_dir_all(
         std::path::Path::new(&out_path).parent().unwrap_or(std::path::Path::new("."))
@@ -692,7 +704,7 @@ fn cmd_pretrain(args: &[String]) {
         let device = WgpuDevice::default();
         run_pretrain_burn::<Autodiff<Wgpu>>(
             initial_weights, &out_path, num_games, num_players, lr,
-            value_epochs, policy_epochs, cand_epochs, batch_size, &device,
+            joint_epochs, value_epochs, cand_epochs, batch_size, &device,
         );
         return;
     }
@@ -702,7 +714,7 @@ fn cmd_pretrain(args: &[String]) {
         let device = NdArrayDevice::Cpu;
         run_pretrain_burn::<Autodiff<NdArray>>(
             initial_weights, &out_path, num_games, num_players, lr,
-            value_epochs, policy_epochs, cand_epochs, batch_size, &device,
+            joint_epochs, value_epochs, cand_epochs, batch_size, &device,
         );
     }
 }
@@ -749,6 +761,7 @@ fn run_rl_burn<B: AutodiffBackend>(
     gamma:           f32,
     lambda:          f32,
     cand_lr_mult:    f32,
+    advcpu_share:    f32,
     device:          &B::Device,
 ) {
     let mut net_burn = NetV6Burn::<B>::from_weights(&initial_weights, device);
@@ -789,7 +802,7 @@ fn run_rl_burn<B: AutodiffBackend>(
         let current_weights = Arc::new(ndarray_weights.clone());
         let new_samples = run_self_play_v6(
             games_per, num_players, current_weights, &snapshot_pool,
-            temperature, gamma, lambda,
+            temperature, gamma, lambda, advcpu_share,
         );
         let new_count = new_samples.len();
         per.push_batch(new_samples);
@@ -928,6 +941,7 @@ fn cmd_rl(args: &[String]) {
     let per_beta       = flag_f32(args, "--per-beta", 0.4);
     let per_size       = flag_usize(args, "--per-size", 500_000);
     let cand_lr_mult   = flag_f32(args, "--cand-lr-mult", 3.0);
+    let advcpu_share   = flag_f32(args, "--advcpu-share", 0.3);
     let eval_every     = flag_usize(args, "--eval-every", 50);
     let eval_games     = flag_usize(args, "--eval-games", 400);
     let gamma          = flag_f32(args, "--gamma", 0.99);
@@ -959,7 +973,7 @@ fn cmd_rl(args: &[String]) {
             snapshot_every, pool_cap,
             per_alpha, per_beta, per_size,
             eval_every, eval_games, gamma, lambda,
-            cand_lr_mult, &device,
+            cand_lr_mult, advcpu_share, &device,
         );
         return;
     }
@@ -976,7 +990,7 @@ fn cmd_rl(args: &[String]) {
             snapshot_every, pool_cap,
             per_alpha, per_beta, per_size,
             eval_every, eval_games, gamma, lambda,
-            cand_lr_mult, &device,
+            cand_lr_mult, advcpu_share, &device,
         );
     }
 }
