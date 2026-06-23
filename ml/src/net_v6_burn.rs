@@ -1,23 +1,23 @@
 // Burn-based training backend for Astra-6.
 // Game generation and inference remain in net_v6.rs / self_play_v6.rs (ndarray, CPU).
-// Only the RL training step runs on burn (GPU via WGPU, or NdArray fallback).
+// Only training steps run on burn (GPU via WGPU, or NdArray fallback).
 
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
-    optim::{Adam, AdamConfig, GradientsParams, Optimizer},
+    nn::Linear,
+    optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     tensor::{activation, backend::AutodiffBackend, Int, TensorData},
 };
 
 use crate::action::NUM_ACTIONS;
 use crate::candidate::CAND_DIM;
-use crate::feature_v6::FEATURE_DIM_V6;
 use crate::net_v6::{WeightsV6, INPUT_DIM};
-use crate::self_play_v6::RlSampleV6;
 
 const H:  usize = 512;
 const HC: usize = 32;
+
+pub const MAX_CANDS: usize = 8;
 
 // ── Network definition ────────────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ impl<B: Backend> NetV6Burn<B> {
 
 // ── Forward (body only; autodiff-compatible) ──────────────────────────────────
 
-fn body_forward<B: Backend>(net: &NetV6Burn<B>, x: Tensor<B, 2>) -> Tensor<B, 2> {
+pub fn body_forward<B: Backend>(net: &NetV6Burn<B>, x: Tensor<B, 2>) -> Tensor<B, 2> {
     let a1 = activation::relu(net.l1.forward(x));
     let a2 = activation::relu(net.l2.forward(a1.clone()) + a1);
     let a3 = activation::relu(net.l3.forward(a2.clone()) + a2);
@@ -190,4 +190,120 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, B>>(
     let net = optim.step(lr, net, grads);
 
     (net, pl_val, vl_val)
+}
+
+// ── Supervised pretraining steps ─────────────────────────────────────────────
+
+/// MSE loss on value head. Trains body + lv. Used for value imitation pretraining.
+pub fn pretrain_value_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, B>>(
+    net:      NetV6Burn<B>,
+    optim:    &mut O,
+    lr:       f64,
+    feats:    &[Vec<f32>],
+    outcomes: &[f32],
+    device:   &B::Device,
+) -> (NetV6Burn<B>, f32) {
+    let b = feats.len();
+    assert!(b > 0);
+    let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+    let x = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+    let values = activation::sigmoid(net.lv.forward(body_forward(&net, x)));  // [B, 1]
+    let tgt = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
+    let diff = values - tgt;
+    let loss = (diff.clone() * diff).mean();
+    let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let grads = GradientsParams::from_grads(loss.backward(), &net);
+    (optim.step(lr, net, grads), lv)
+}
+
+/// CE loss on policy head. Trains body + lp. Used for policy imitation pretraining.
+pub fn pretrain_policy_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, B>>(
+    net:     NetV6Burn<B>,
+    optim:   &mut O,
+    lr:      f64,
+    feats:   &[Vec<f32>],
+    masks:   &[u64],
+    actions: &[u8],
+    device:  &B::Device,
+) -> (NetV6Burn<B>, f32) {
+    let b = feats.len();
+    assert!(b > 0);
+    let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+    let x = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+    let logits = net.lp.forward(body_forward(&net, x));
+    let mask_flat: Vec<f32> = masks.iter().flat_map(|&m| {
+        (0..NUM_ACTIONS).map(move |i| if m & (1u64 << i) != 0 { 0.0f32 } else { -1e9f32 })
+    }).collect();
+    let mask_t = Tensor::<B, 2>::from_data(TensorData::new(mask_flat, [b, NUM_ACTIONS]), device);
+    let log_p = activation::log_softmax(logits + mask_t, 1);
+    let act_t = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(actions.iter().map(|&a| a as i32).collect::<Vec<_>>(), [b, 1]), device,
+    );
+    let loss = -log_p.gather(1, act_t).mean();
+    let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let grads = GradientsParams::from_grads(loss.backward(), &net);
+    (optim.step(lr, net, grads), lv)
+}
+
+/// CE loss on candidate head. Trains body + lc1 + lc2.
+/// Used for both imitation pretraining and RL candidate fine-tuning.
+///
+/// `cands_flat[i]` is a flat slice of length `n_cands_i * CAND_DIM` for sample i.
+/// Samples are padded internally to MAX_CANDS with a -1e9 mask.
+pub fn cand_step_burn<B: AutodiffBackend, O: Optimizer<NetV6Burn<B>, B>>(
+    net:        NetV6Burn<B>,
+    optim:      &mut O,
+    lr:         f64,
+    feats:      &[Vec<f32>],
+    cands_flat: &[Vec<f32>],
+    chosen:     &[u8],
+    device:     &B::Device,
+) -> (NetV6Burn<B>, f32) {
+    let b = feats.len();
+    assert!(b > 0);
+
+    // Body [B, H]
+    let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+    let x = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+    let body = body_forward(&net, x);
+
+    // Build padded candidate data [B*MAX_CANDS, CAND_DIM] and validity mask [B, MAX_CANDS]
+    let mut cand_data  = vec![0.0f32; b * MAX_CANDS * CAND_DIM];
+    let mut valid_mask = vec![-1e9f32; b * MAX_CANDS];
+    for (i, cf) in cands_flat.iter().enumerate() {
+        let nc = (cf.len() / CAND_DIM).min(MAX_CANDS);
+        for j in 0..nc {
+            let src = j * CAND_DIM;
+            let dst = (i * MAX_CANDS + j) * CAND_DIM;
+            cand_data[dst..dst + CAND_DIM].copy_from_slice(&cf[src..src + CAND_DIM]);
+            valid_mask[i * MAX_CANDS + j] = 0.0;
+        }
+    }
+
+    // Expand body: [B, H] → [B, 1, H] → [B, MAX_CANDS, H] → [B*MAX_CANDS, H]
+    let body_3d: Tensor<B, 3>  = body.reshape([b, 1, H]);
+    let body_rep: Tensor<B, 3> = body_3d.repeat_dim(1, MAX_CANDS);
+    let body_flat: Tensor<B, 2> = body_rep.reshape([b * MAX_CANDS, H]);
+
+    // Concat with candidate features → [B*MAX_CANDS, H+CAND_DIM]
+    let cand_t = Tensor::<B, 2>::from_data(
+        TensorData::new(cand_data, [b * MAX_CANDS, CAND_DIM]), device,
+    );
+    let inp = Tensor::cat(vec![body_flat, cand_t], 1);
+
+    // Score → [B*MAX_CANDS, 1] → [B, MAX_CANDS]
+    let scores: Tensor<B, 2> = net.lc2
+        .forward(activation::relu(net.lc1.forward(inp)))
+        .reshape([b, MAX_CANDS]);
+
+    // Masked CE
+    let mask_t = Tensor::<B, 2>::from_data(TensorData::new(valid_mask, [b, MAX_CANDS]), device);
+    let log_p  = activation::log_softmax(scores + mask_t, 1);
+    let chosen_t = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(chosen.iter().map(|&c| c as i32).collect::<Vec<_>>(), [b, 1]), device,
+    );
+    let loss = -log_p.gather(1, chosen_t).mean();
+    let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let grads = GradientsParams::from_grads(loss.backward(), &net);
+    (optim.step(lr, net, grads), lv)
 }

@@ -20,16 +20,20 @@ use crate::action::{
 use crate::candidate::{CAND_DIM, encode_card_candidate, encode_system_candidate, encode_target_candidate};
 use crate::feature_v6::{encode_v6, FEATURE_DIM_V6};
 use crate::net_v6::{NetV6, WeightsV6, INPUT_DIM};
+use crate::net_v6_burn::MAX_CANDS;
 
 // ── Sample produced by a self-play game ───────────────────────────────────────
 
 pub struct RlSampleV6 {
-    pub features:   Vec<f32>,  // length INPUT_DIM (3 stacked snapshots)
-    pub legal_mask: u64,
-    pub action:     u8,
-    pub outcome:    f32,
-    pub log_prob:   f32,
-    pub td_error:   f32,       // |advantage|, used for PER priority
+    pub features:    Vec<f32>,  // length INPUT_DIM (3 stacked snapshots)
+    pub legal_mask:  u64,
+    pub action:      u8,
+    pub outcome:     f32,
+    pub log_prob:    f32,
+    pub td_error:    f32,       // |advantage|, used for PER priority
+    pub value:       f32,       // value estimate at decision time (for advantage)
+    pub cand_feats:  Vec<f32>,  // flat: n_cands * CAND_DIM; empty if no candidate choice
+    pub cand_chosen: u8,        // index into cand_feats / CAND_DIM
 }
 
 // ── Per-decision buffer entry ─────────────────────────────────────────────────
@@ -41,6 +45,8 @@ struct Pending {
     log_prob:      f32,
     shaped_reward: f32,
     value:         f32,
+    cand_feats:    Vec<f32>,  // flat: n_cands * CAND_DIM; empty if no candidate choice
+    cand_chosen:   u8,
 }
 
 // ── Stacked state buffer ──────────────────────────────────────────────────────
@@ -145,9 +151,13 @@ impl SelfPlayPlayerV6 {
         stack.stacked()
     }
 
-    fn record(&self, features: Vec<f32>, mask: u64, action: u8, log_prob: f32, value: f32) {
+    fn record(
+        &self, features: Vec<f32>, mask: u64, action: u8, log_prob: f32, value: f32,
+        cand_feats: Vec<f32>, cand_chosen: u8,
+    ) {
         self.buffer.lock().unwrap().push(Pending {
             features, legal_mask: mask, action, log_prob, shaped_reward: 0.0, value,
+            cand_feats, cand_chosen,
         });
     }
 }
@@ -164,45 +174,63 @@ impl Player for SelfPlayPlayerV6 {
         let (abs_idx, log_prob, val, body) =
             self.net.infer_stochastic_with_body(&features, mask, self.temperature, u);
 
-        self.record(features.to_vec(), mask, abs_idx as u8, log_prob, val);
-
         let hand = &view.my_hand;
         let matching: Vec<usize> = legal.iter().enumerate()
             .filter(|(_, a)| action_to_abstract(a, hand) == Some(abs_idx))
             .map(|(i, _)| i)
             .collect();
 
+        let result_idx;
+        let cand_feats: Vec<f32>;
+        let cand_chosen: u8;
+
         if !matching.is_empty() {
-            if matching.len() == 1 { return matching[0]; }
-            let total = matching.len();
-            let cands: Vec<[f32; CAND_DIM]> = matching.iter().enumerate().map(|(slot, &ci)| {
-                match &legal[ci] {
-                    novacana_engine::player::Action::PlayDiscovery { onto_star, .. } => {
-                        view.my_star_chart.systems.iter()
-                            .find(|s| s.star_id == *onto_star)
-                            .map(|s| encode_system_candidate(s, false, slot, total))
-                            .unwrap_or([0.0; CAND_DIM])
+            if matching.len() == 1 {
+                result_idx = matching[0];
+                cand_feats = Vec::new();
+                cand_chosen = 0;
+            } else {
+                let total = matching.len();
+                let cands: Vec<[f32; CAND_DIM]> = matching.iter().enumerate().map(|(slot, &ci)| {
+                    match &legal[ci] {
+                        novacana_engine::player::Action::PlayDiscovery { onto_star, .. } => {
+                            view.my_star_chart.systems.iter()
+                                .find(|s| s.star_id == *onto_star)
+                                .map(|s| encode_system_candidate(s, false, slot, total))
+                                .unwrap_or([0.0; CAND_DIM])
+                        }
+                        novacana_engine::player::Action::PlayStar(id) => {
+                            hand.iter().find(|c| c.id == *id)
+                                .map(|c| encode_card_candidate(c, slot, total))
+                                .unwrap_or([0.0; CAND_DIM])
+                        }
+                        _ => {
+                            let mut c = [0.0f32; CAND_DIM];
+                            c[22] = slot as f32 / total as f32;
+                            c[23] = total as f32 / 10.0;
+                            c
+                        }
                     }
-                    novacana_engine::player::Action::PlayStar(id) => {
-                        hand.iter().find(|c| c.id == *id)
-                            .map(|c| encode_card_candidate(c, slot, total))
-                            .unwrap_or([0.0; CAND_DIM])
-                    }
-                    _ => { let mut c = [0.0f32; CAND_DIM]; c[22] = slot as f32 / total as f32; c[23] = total as f32 / 10.0; c }
-                }
-            }).collect();
-            let scores = self.net.score_candidates(&body, &cands);
-            let best = scores.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i).unwrap_or(0);
-            return matching[best];
+                }).collect();
+                // Only score / record up to MAX_CANDS candidates
+                let nc = cands.len().min(MAX_CANDS);
+                let scores = self.net.score_candidates(&body, &cands[..nc]);
+                let best = scores.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i).unwrap_or(0);
+                result_idx = matching[best];
+                cand_feats = cands[..nc].iter().flat_map(|c| c.iter().copied()).collect();
+                cand_chosen = best as u8;
+            }
+        } else {
+            let idx = self.fallback.choose_action(view, legal);
+            let abs = action_to_abstract(&legal[idx], hand).unwrap_or(abs_idx);
+            self.record(features.to_vec(), mask, abs as u8, log_prob, val, Vec::new(), 0);
+            return idx;
         }
 
-        let idx = self.fallback.choose_action(view, legal);
-        if let Some(a) = action_to_abstract(&legal[idx], &view.my_hand) {
-            if let Some(last) = self.buffer.lock().unwrap().last_mut() { last.action = a as u8; }
-        }
-        idx
+        self.record(features.to_vec(), mask, abs_idx as u8, log_prob, val, cand_feats, cand_chosen);
+        result_idx
     }
 
     fn respond_to_chain(&self, view: &GameView, _chain: &ChainView, legal: &[ChainAction]) -> Option<usize> {
@@ -212,7 +240,7 @@ impl Player for SelfPlayPlayerV6 {
         let (abs_idx, log_prob, val, _body) =
             self.net.infer_stochastic_with_body(&features, mask, self.temperature, u);
 
-        self.record(features.to_vec(), mask, abs_idx as u8, log_prob, val);
+        self.record(features.to_vec(), mask, abs_idx as u8, log_prob, val, Vec::new(), 0);
 
         if abs_idx == 0 { return None; }
         if let Some(r) = abstract_to_chain(abs_idx, legal, &view.my_hand) {
@@ -339,12 +367,15 @@ fn run_one_game_v6(
         for (p, ret) in pending.into_iter().zip(returns) {
             let td_error = (ret - p.value).abs();
             out.push(RlSampleV6 {
-                features:   p.features,
-                legal_mask: p.legal_mask,
-                action:     p.action,
-                outcome:    ret,
-                log_prob:   p.log_prob,
+                features:    p.features,
+                legal_mask:  p.legal_mask,
+                action:      p.action,
+                outcome:     ret,
+                log_prob:    p.log_prob,
                 td_error,
+                value:       p.value,
+                cand_feats:  p.cand_feats,
+                cand_chosen: p.cand_chosen,
             });
         }
     }
