@@ -183,4 +183,12 @@ impl Deck {
     pub fn is_empty(&self) -> bool {
         self.cards.is_empty()
     }
+
+    /// Card IDs currently in the deck, in order. Used by the engine test
+    /// suite's card-conservation invariant checker (see engine/src/game.rs
+    /// `tests::assert_card_conservation`) to account for every card
+    /// somewhere in the game.
+    pub fn all_ids(&self) -> Vec<CardId> {
+        self.cards.iter().map(|c| c.id).collect()
+    }
 }

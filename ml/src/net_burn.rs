@@ -3,7 +3,7 @@
 // All gradient steps run here (WGPU GPU or NdArray CPU fallback).
 
 use burn::{
-    module::Module,
+    module::{AutodiffModule, Module},
     nn::{Linear, LinearConfig},
     grad_clipping::GradientClippingConfig,
     optim::{AdamConfig, GradientsParams, Optimizer},
@@ -16,9 +16,11 @@ use crate::candidate::CAND_DIM;
 use crate::net::{Weights, INPUT_DIM};
 
 const H:  usize = 512;
-const HC: usize = 32;
+const HC: usize = 128;
 
-pub const MAX_CANDS: usize = 8;
+// 16, not 8: the collapsed PlayDiscovery abstract action's matching set is a
+// cross-product (discovery types in hand × incomplete systems) and can exceed 8.
+pub const MAX_CANDS: usize = 16;
 
 // ── Network definition ────────────────────────────────────────────────────────
 
@@ -167,7 +169,7 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
     entropy_coeff: f32,
     clip_eps:      f32,
     device:        &B::Device,
-) -> (NetBurn<B>, f32, f32) {
+) -> (NetBurn<B>, f32, f32, Vec<f32>) {
     let b = feats.len();
     assert!(b > 0);
 
@@ -192,9 +194,10 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
     let old_lp_t   = Tensor::<B, 2>::from_data(TensorData::new(old_lps.to_vec(), [b, 1]), device);
     let ratio      = (new_lp - old_lp_t).exp();
     let outcomes_t = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
-    let advantage  = outcomes_t.clone() - values.clone();
+    // Detach: the policy surrogate must not backprop through the value head.
+    let advantage  = (outcomes_t.clone() - values.clone()).detach();
     let surr1 = ratio.clone() * advantage.clone();
-    let surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantage;
+    let surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantage.clone();
     let ppo_obj = (surr1.clone() + surr2.clone() - (surr1 - surr2).abs()) * 0.5;
 
     let probs   = activation::softmax(masked, 1);
@@ -203,15 +206,20 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
     let is_t = Tensor::<B, 2>::from_data(TensorData::new(is_weights_in.to_vec(), [b, 1]), device);
 
     let policy_loss = -(is_t.clone() * (ppo_obj + entropy * entropy_coeff)).mean();
-    let diff        = values - outcomes_t;
+    // GAE returns can fall outside [0,1] due to shaped rewards while the value
+    // head is sigmoid — clamp the value-loss target only (advantage above stays
+    // on the unclamped returns).
+    let value_tgt   = outcomes_t.clamp(0.0, 1.0);
+    let diff        = values - value_tgt;
     let value_loss  = (is_t * diff.clone() * diff).mean();
 
     let pl_val: f32 = policy_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
     let vl_val: f32 = value_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let td_errors: Vec<f32> = advantage.abs().into_data().to_vec::<f32>().unwrap_or_default();
 
     let total = policy_loss + value_loss;
     let grads = GradientsParams::from_grads(total.backward(), &net);
-    (optim.step(lr, net, grads), pl_val, vl_val)
+    (optim.step(lr, net, grads), pl_val, vl_val, td_errors)
 }
 
 // ── AlphaZero training step ───────────────────────────────────────────────────
@@ -268,19 +276,48 @@ pub fn az_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
 
 // ── Supervised pretraining steps ─────────────────────────────────────────────
 
+// Body forward for head-only fine-tune steps. freeze=true runs the trunk on
+// the INNER (non-autodiff) backend and re-imports the activations as a
+// constant leaf. This both stops gradients at the trunk and avoids building
+// the trunk's autodiff graph at all — a detach()ed subgraph is never reached
+// by backward(), and burn only frees graph state on backward, so detach leaks
+// the whole trunk graph every batch.
+fn frozen_or_live_body<B: AutodiffBackend>(
+    net:       &NetBurn<B>,
+    feat_flat: Vec<f32>,
+    b:         usize,
+    freeze:    bool,
+    device:    &B::Device,
+) -> Tensor<B, 2> {
+    if freeze {
+        let x = Tensor::<B::InnerBackend, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+        Tensor::from_inner(body_forward(&net.valid(), x))
+    } else {
+        let x = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+        body_forward(net, x)
+    }
+}
+
 pub fn pretrain_value_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
-    net:      NetBurn<B>,
-    optim:    &mut O,
-    lr:       f64,
-    feats:    &[Vec<f32>],
-    outcomes: &[f32],
-    device:   &B::Device,
+    net:          NetBurn<B>,
+    optim:        &mut O,
+    lr:           f64,
+    feats:        &[Vec<f32>],
+    outcomes:     &[f32],
+    freeze_trunk: bool,
+    device:       &B::Device,
 ) -> (NetBurn<B>, f32) {
     let b = feats.len();
     assert!(b > 0);
     let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
-    let x      = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
-    let values = activation::sigmoid(net.lv.forward(body_forward(&net, x)));
+    // When freeze_trunk, run the body on the INNER backend so gradients train
+    // only the value head: the value head becomes a readout on the
+    // policy-optimized trunk, preventing value MSE from degrading the policy
+    // (the epoch-8→30 policy regression). Inner backend, not detach(): a
+    // detached trunk subgraph is never reached by backward(), and burn only
+    // frees autodiff graph state on backward — detach leaked ~5GB/epoch.
+    let body = frozen_or_live_body(&net, feat_flat, b, freeze_trunk, device);
+    let values = activation::sigmoid(net.lv.forward(body));
     let tgt    = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
     let diff   = values - tgt;
     let loss   = (diff.clone() * diff).mean();
@@ -290,13 +327,14 @@ pub fn pretrain_value_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>
 }
 
 pub fn pretrain_policy_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
-    net:     NetBurn<B>,
-    optim:   &mut O,
-    lr:      f64,
-    feats:   &[Vec<f32>],
-    masks:   &[u64],
-    actions: &[u8],
-    device:  &B::Device,
+    net:             NetBurn<B>,
+    optim:           &mut O,
+    lr:              f64,
+    feats:           &[Vec<f32>],
+    masks:           &[u64],
+    actions:         &[u8],
+    label_smoothing: f32,
+    device:          &B::Device,
 ) -> (NetBurn<B>, f32) {
     let b = feats.len();
     assert!(b > 0);
@@ -311,22 +349,74 @@ pub fn pretrain_policy_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>
     let act_t  = Tensor::<B, 2, Int>::from_data(
         TensorData::new(actions.iter().map(|&a| a as i32).collect::<Vec<_>>(), [b, 1]), device,
     );
-    let loss = -log_p.gather(1, act_t).mean();
-    let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let hard = -log_p.clone().gather(1, act_t);
+    let loss = if label_smoothing > 0.0 {
+        let legal_flat: Vec<f32> = masks.iter().flat_map(|&m| {
+            (0..NUM_ACTIONS).map(move |i| if m & (1u64 << i) != 0 { 1.0f32 } else { 0.0f32 })
+        }).collect();
+        let legal_ind = Tensor::<B, 2>::from_data(TensorData::new(legal_flat, [b, NUM_ACTIONS]), device);
+        let num_legal = legal_ind.clone().sum_dim(1);
+        let uniform   = -(log_p * legal_ind).sum_dim(1) / num_legal;
+        let eps = label_smoothing;
+        (hard.clone() * (1.0 - eps) + uniform * eps).mean()
+    } else {
+        hard.clone().mean()
+    };
+    let lv = hard.mean().into_data().to_vec::<f32>().unwrap_or_default()[0];
     let grads = GradientsParams::from_grads(loss.backward(), &net);
     (optim.step(lr, net, grads), lv)
 }
 
+/// Forward-only policy evaluation on a held-out batch.
+/// Returns (argmax_correct_count, summed_hard_cross_entropy) so callers can
+/// accumulate across batches and checkpoint on *generalization* rather than
+/// epoch count. Takes a plain-Backend net: autodiff callers must pass
+/// `net.valid()` — forward passes on the autodiff backend accumulate graph
+/// state that only backward() releases (~600MB/epoch leak, earlyoom kill).
+pub fn policy_eval_burn<B: Backend>(
+    net:     &NetBurn<B>,
+    feats:   &[Vec<f32>],
+    masks:   &[u64],
+    actions: &[u8],
+    device:  &B::Device,
+) -> (usize, f32) {
+    let b = feats.len();
+    if b == 0 { return (0, 0.0); }
+    let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+    let x      = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
+    let logits = net.lp.forward(body_forward(net, x));
+    let mask_flat: Vec<f32> = masks.iter().flat_map(|&m| {
+        (0..NUM_ACTIONS).map(move |i| if m & (1u64 << i) != 0 { 0.0f32 } else { -1e9f32 })
+    }).collect();
+    let mask_t = Tensor::<B, 2>::from_data(TensorData::new(mask_flat, [b, NUM_ACTIONS]), device);
+    let masked = (logits + mask_t).into_data().to_vec::<f32>().unwrap_or_default();
+
+    let mut correct = 0usize;
+    let mut ce_sum  = 0.0f32;
+    for i in 0..b {
+        let row = &masked[i * NUM_ACTIONS..(i + 1) * NUM_ACTIONS];
+        let argmax = row.iter().enumerate()
+            .max_by(|a, c| a.1.partial_cmp(c.1).unwrap())
+            .map(|(j, _)| j).unwrap_or(0);
+        if argmax == actions[i] as usize { correct += 1; }
+        let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+        ce_sum += lse - row[actions[i] as usize];
+    }
+    (correct, ce_sum)
+}
+
 /// Combined policy CE + value MSE in one backward pass.
 pub fn pretrain_joint_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
-    net:      NetBurn<B>,
-    optim:    &mut O,
-    lr:       f64,
-    feats:    &[Vec<f32>],
-    masks:    &[u64],
-    actions:  &[u8],
-    outcomes: &[f32],
-    device:   &B::Device,
+    net:             NetBurn<B>,
+    optim:           &mut O,
+    lr:              f64,
+    feats:           &[Vec<f32>],
+    masks:           &[u64],
+    actions:         &[u8],
+    outcomes:        &[f32],
+    label_smoothing: f32,
+    device:          &B::Device,
 ) -> (NetBurn<B>, f32, f32) {
     let b = feats.len();
     assert!(b > 0);
@@ -343,14 +433,31 @@ pub fn pretrain_joint_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>
     let act_t  = Tensor::<B, 2, Int>::from_data(
         TensorData::new(actions.iter().map(|&a| a as i32).collect::<Vec<_>>(), [b, 1]), device,
     );
-    let policy_loss = -log_p.gather(1, act_t).mean();
+    // Hard cross-entropy against AdvCPU's chosen action.
+    let hard = -log_p.clone().gather(1, act_t);          // [b, 1]
+    // Masked label smoothing: spread `eps` mass uniformly over the *legal* set,
+    // so the policy keeps nonzero probability on alternatives. This directly
+    // attacks the near-degenerate delta-function policy (agree_mass≈1.0) that
+    // leaves PPO with no gradient signal on alternative actions.
+    let policy_loss = if label_smoothing > 0.0 {
+        let legal_flat: Vec<f32> = masks.iter().flat_map(|&m| {
+            (0..NUM_ACTIONS).map(move |i| if m & (1u64 << i) != 0 { 1.0f32 } else { 0.0f32 })
+        }).collect();
+        let legal_ind = Tensor::<B, 2>::from_data(TensorData::new(legal_flat, [b, NUM_ACTIONS]), device);
+        let num_legal = legal_ind.clone().sum_dim(1);                  // [b, 1]
+        let uniform   = -(log_p * legal_ind).sum_dim(1) / num_legal;   // [b, 1]
+        let eps = label_smoothing;
+        (hard.clone() * (1.0 - eps) + uniform * eps).mean()
+    } else {
+        hard.clone().mean()
+    };
 
     let values     = activation::sigmoid(net.lv.forward(body));
     let tgt        = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
     let diff       = values - tgt;
     let value_loss = (diff.clone() * diff).mean();
 
-    let pl = policy_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+    let pl = hard.mean().into_data().to_vec::<f32>().unwrap_or_default()[0];
     let vl = value_loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
 
     let total = policy_loss + value_loss;
@@ -360,20 +467,24 @@ pub fn pretrain_joint_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>
 
 /// CE loss on candidate head. Used for both pretraining and RL/AZ fine-tuning.
 pub fn cand_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
-    net:        NetBurn<B>,
-    optim:      &mut O,
-    lr:         f64,
-    feats:      &[Vec<f32>],
-    cands_flat: &[Vec<f32>],
-    chosen:     &[u8],
-    device:     &B::Device,
+    net:          NetBurn<B>,
+    optim:        &mut O,
+    lr:           f64,
+    feats:        &[Vec<f32>],
+    cands_flat:   &[Vec<f32>],
+    chosen:       &[u8],
+    advantages:   Option<&[f32]>,
+    freeze_trunk: bool,
+    device:       &B::Device,
 ) -> (NetBurn<B>, f32) {
     let b = feats.len();
     assert!(b > 0);
 
     let feat_flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
-    let x    = Tensor::<B, 2>::from_data(TensorData::new(feat_flat, [b, INPUT_DIM]), device);
-    let body = body_forward(&net, x);
+    // freeze_trunk: inner-backend body so candidate training only updates the
+    // candidate head, preserving the policy-optimized trunk during pretraining
+    // (see frozen_or_live_body for why this is not a detach()).
+    let body = frozen_or_live_body(&net, feat_flat, b, freeze_trunk, device);
 
     let mut cand_data  = vec![0.0f32; b * MAX_CANDS * CAND_DIM];
     let mut valid_mask = vec![-1e9f32; b * MAX_CANDS];
@@ -405,7 +516,19 @@ pub fn cand_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
     let chosen_t = Tensor::<B, 2, Int>::from_data(
         TensorData::new(chosen.iter().map(|&c| c as i32).collect::<Vec<_>>(), [b, 1]), device,
     );
-    let loss = -log_p.gather(1, chosen_t).mean();
+    let picked = log_p.gather(1, chosen_t);   // [b, 1]
+    // advantages=None → plain CE toward `chosen` (BC imitation of AdvCPU).
+    // advantages=Some → REINFORCE: -A·log p(chosen). During RL `chosen` is the
+    // head's own pick, so unweighted CE is pure self-imitation with zero
+    // learning signal; advantage weighting reinforces picks that won and
+    // pushes away from picks that lost.
+    let loss = match advantages {
+        Some(a) => {
+            let w = Tensor::<B, 2>::from_data(TensorData::new(a.to_vec(), [b, 1]), device);
+            -(picked * w).mean()
+        }
+        None => -picked.mean(),
+    };
     let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
     let grads = GradientsParams::from_grads(loss.backward(), &net);
     (optim.step(lr, net, grads), lv)

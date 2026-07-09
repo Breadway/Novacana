@@ -3,19 +3,19 @@ use novacana_engine::{
     player::{Action, ChainAction, ProtostarChoice},
 };
 
-pub const NUM_ACTIONS: usize = 35;
+pub const NUM_ACTIONS: usize = 31;
 
 // ── Abstract action layout ────────────────────────────────────────────────────
 //
 //  0        Pass
 //  1- 6     PlayStar(YDwarf, RGiant, RSuper, WDwarf, RDwarf, BDwarf)
-//  7-11     PlayDiscovery(AsteroidBelt, DwarfPlanet, RockyPlanet, GasGiant, Comet)
-// 12-17     PlaySolarSystem(same 6 star kinds)
-// 18-22     PlayFlare(StellarAlignment, CosmicDenial, Wormhole, Ignition, AstralProjection)
-// 23        PlaySupernovas
-// 24-30     PlayFracture(BlackHole, Athena, Pulsar, DMV, QEF, SNC, Shockwave)
-// 31-32     PlayProtostar(DrawTwo, SearchWhiteDwarf)
-// 33-34     PlayOmen(SolarEclipse, PlanetOfLife)
+//  7        PlayDiscovery (any type; candidate head disambiguates type+system)
+//  8-13     PlaySolarSystem(same 6 star kinds)
+// 14-18     PlayFlare(StellarAlignment, CosmicDenial, Wormhole, Ignition, AstralProjection)
+// 19        PlaySupernovas
+// 20-26     PlayFracture(BlackHole, Athena, Pulsar, DMV, QEF, SNC, Shockwave)
+// 27-28     PlayProtostar(DrawTwo, SearchWhiteDwarf)
+// 29-30     PlayOmen(SolarEclipse, PlanetOfLife)
 
 fn star_abstract(name: StarName) -> Option<usize> {
     Some(match name {
@@ -30,37 +30,32 @@ fn star_abstract(name: StarName) -> Option<usize> {
 }
 
 fn disc_abstract(kind: &CardKind) -> Option<usize> {
-    use novacana_engine::card::DiscoveryName::*;
-    Some(match kind {
-        CardKind::Discovery(AsteroidBelt) =>  7,
-        CardKind::Discovery(DwarfPlanet)  =>  8,
-        CardKind::Discovery(RockyPlanet)  =>  9,
-        CardKind::Discovery(GasGiant)     => 10,
-        CardKind::Discovery(Comet)        => 11,
-        _ => return None,
-    })
+    match kind {
+        CardKind::Discovery(_) => Some(7),
+        _ => None,
+    }
 }
 
 fn flare_abstract(f: FlareName) -> Option<usize> {
     Some(match f {
-        FlareName::StellarAlignment => 18,
-        FlareName::CosmicDenial     => 19,
-        FlareName::Wormhole         => 20,
-        FlareName::Ignition         => 21,
-        FlareName::AstralProjection => 22,
+        FlareName::StellarAlignment => 14,
+        FlareName::CosmicDenial     => 15,
+        FlareName::Wormhole         => 16,
+        FlareName::Ignition         => 17,
+        FlareName::AstralProjection => 18,
         _ => return None, // supernovas handled separately
     })
 }
 
 fn fracture_abstract(f: FractureName) -> usize {
     match f {
-        FractureName::BlackHole                    => 24,
-        FractureName::Athena                       => 25,
-        FractureName::Pulsar                       => 26,
-        FractureName::DarkMatterVoid               => 27,
-        FractureName::QuantumEntanglementFailure   => 28,
-        FractureName::StellarNurseryCollapse       => 29,
-        FractureName::Shockwave                    => 30,
+        FractureName::BlackHole                    => 20,
+        FractureName::Athena                       => 21,
+        FractureName::Pulsar                       => 22,
+        FractureName::DarkMatterVoid               => 23,
+        FractureName::QuantumEntanglementFailure   => 24,
+        FractureName::StellarNurseryCollapse       => 25,
+        FractureName::Shockwave                    => 26,
     }
 }
 
@@ -84,7 +79,7 @@ pub fn action_to_abstract(action: &Action, hand: &[Card]) -> Option<usize> {
 
         Action::PlaySolarSystem { star: id, .. } => {
             if let Some(CardKind::Star(name)) = lookup_kind(*id) {
-                star_abstract(*name).map(|base| base + 11) // offset by 11 → 12-17
+                star_abstract(*name).map(|base| base + 7) // offset by 7 → 8-13
             } else { None }
         }
 
@@ -94,7 +89,7 @@ pub fn action_to_abstract(action: &Action, hand: &[Card]) -> Option<usize> {
             } else { None }
         }
 
-        Action::PlaySupernovas { .. } => Some(23),
+        Action::PlaySupernovas { .. } => Some(19),
 
         Action::PlayFracture(id) => {
             if let Some(CardKind::Fracture(f)) = lookup_kind(*id) {
@@ -103,14 +98,14 @@ pub fn action_to_abstract(action: &Action, hand: &[Card]) -> Option<usize> {
         }
 
         Action::PlayProtostar { choice, .. } => Some(match choice {
-            ProtostarChoice::DrawTwo         => 31,
-            ProtostarChoice::SearchWhiteDwarf => 32,
+            ProtostarChoice::DrawTwo         => 27,
+            ProtostarChoice::SearchWhiteDwarf => 28,
         }),
 
         Action::PlayOmen { card: id, .. } => {
             Some(match lookup_kind(*id)? {
-                CardKind::Omen(OmenName::SolarEclipse) => 33,
-                CardKind::Omen(OmenName::PlanetOfLife) => 34,
+                CardKind::Omen(OmenName::SolarEclipse) => 29,
+                CardKind::Omen(OmenName::PlanetOfLife) => 30,
                 _ => return None,
             })
         }
@@ -124,8 +119,8 @@ pub fn chain_response_to_abstract(ca: &ChainAction, hand: &[Card]) -> Option<usi
     match kind {
         CardKind::Flare(f) => flare_abstract(*f),
         CardKind::Fracture(f) => Some(fracture_abstract(*f)),
-        CardKind::Omen(OmenName::SolarEclipse) => Some(33),
-        CardKind::Omen(OmenName::PlanetOfLife) => Some(34),
+        CardKind::Omen(OmenName::SolarEclipse) => Some(29),
+        CardKind::Omen(OmenName::PlanetOfLife) => Some(30),
         _ => None,
     }
 }

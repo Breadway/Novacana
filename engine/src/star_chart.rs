@@ -172,19 +172,25 @@ impl StarChart {
         BoardWipeResult { to_deck, floating_eclipse_ids: vec![] }
     }
 
-    /// Remove a single Discovery by card ID. Returns (star_name, disc_name) if found.
-    /// Skips eclipse-protected systems unless `bypass_eclipse` is true.
+    /// Remove a single Discovery by card ID. Returns (star_name, disc_name,
+    /// freed_planet_of_life_id) if found — the third element is `Some` when
+    /// the removed Discovery was a Rocky Planet with a Planet of Life omen
+    /// attached, so the caller can return that card to the deck instead of
+    /// silently losing it (a real card-conservation bug this used to have:
+    /// the omen id was dropped along with the rest of the `AttachedDiscovery`
+    /// struct — caught by the engine test suite's card-conservation invariant
+    /// checker). Skips eclipse-protected systems unless `bypass_eclipse` is true.
     pub fn remove_discovery(
         &mut self,
         disc_id: CardId,
         bypass_eclipse: bool,
-    ) -> Option<(StarName, DiscoveryName)> {
+    ) -> Option<(StarName, DiscoveryName, Option<CardId>)> {
         for sys in &mut self.systems {
             if sys.is_eclipse_protected() && !bypass_eclipse {
                 continue;
             }
             if let Some(disc) = sys.remove_discovery(disc_id) {
-                return Some((sys.star_name, disc.name));
+                return Some((sys.star_name, disc.name, disc.planet_of_life_id));
             }
         }
         None

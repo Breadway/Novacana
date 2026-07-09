@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::card::{Card, CardId, CardKind};
-use crate::chain::ChainView;
+use crate::chain::{Chain, ChainResumeCursor, ChainView};
 use crate::game::GameState;
 use crate::star_chart::StarChart;
 
@@ -25,7 +25,7 @@ pub enum Target {
 // ── Actions ───────────────────────────────────────────────────────────────────
 
 /// What a player does during their Action Phase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// End the action phase voluntarily (or forced when hand ≤ 5).
     Pass,
@@ -55,7 +55,7 @@ pub enum Action {
     PlayProtostar { card: CardId, choice: ProtostarChoice },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OmenAttachment {
     /// Solar Eclipse attaches to a completed Solar System identified by its star card.
     SolarEclipse { system_star: CardId },
@@ -63,7 +63,7 @@ pub enum OmenAttachment {
     PlanetOfLife { rocky_planet_disc: CardId },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProtostarChoice {
     /// Option A: draw 2 cards.
     DrawTwo,
@@ -258,14 +258,65 @@ pub trait Player: Send + Sync {
         legal_responses: &[ChainAction],
     ) -> Option<usize>;
 
+    /// Full-state variant of respond_to_chain — receives the complete
+    /// GameState AND the real Chain (not just its summary view) so search
+    /// players can simulate resolving each candidate response. `cursor` is
+    /// the engine's true position in the round-robin response window at
+    /// this decision point — pass it straight through to
+    /// `GameEngine::simulate_finish_chain` to resume look-ahead search with
+    /// the exact continuation semantics the real game would use. Defaults to
+    /// respond_to_chain for all others.
+    fn respond_to_chain_with_state(
+        &self,
+        view: &GameView,
+        _state: &GameState,
+        chain_view: &ChainView,
+        _chain: &Chain,
+        _cursor: ChainResumeCursor,
+        legal_responses: &[ChainAction],
+    ) -> Option<usize> {
+        self.respond_to_chain(view, chain_view, legal_responses)
+    }
+
     /// Pick one option from a numbered list of choices (mid-effect decision point).
     fn decide(&self, view: &GameView, request: &ChoiceRequest) -> usize;
+
+    /// Full-state variant of decide — infrastructure only (see
+    /// `choose_action_with_state`'s doc for the pattern this mirrors): no
+    /// search player currently overrides this, it exists so future work can
+    /// without touching the trait again. Defaults to `decide` for everyone.
+    fn decide_with_state(&self, view: &GameView, _state: &GameState, request: &ChoiceRequest) -> usize {
+        self.decide(view, request)
+    }
 
     /// Pick `count` targets from the supplied list.
     fn pick_targets(&self, view: &GameView, prompt: &str, options: &[TargetOption], count: usize) -> Vec<usize>;
 
+    /// Full-state variant of pick_targets. See `decide_with_state`.
+    fn pick_targets_with_state(
+        &self,
+        view: &GameView,
+        _state: &GameState,
+        prompt: &str,
+        options: &[TargetOption],
+        count: usize,
+    ) -> Vec<usize> {
+        self.pick_targets(view, prompt, options, count)
+    }
+
     /// Select which cards to discard to reach the 5-card hand limit.
     fn choose_discards(&self, view: &GameView, hand: &[Card], must_discard: usize) -> Vec<CardId>;
+
+    /// Full-state variant of choose_discards. See `decide_with_state`.
+    fn choose_discards_with_state(
+        &self,
+        view: &GameView,
+        _state: &GameState,
+        hand: &[Card],
+        must_discard: usize,
+    ) -> Vec<CardId> {
+        self.choose_discards(view, hand, must_discard)
+    }
 
     /// Return and clear any reasoning text the player generated for its last
     /// decision. Called by the game engine immediately after each decision so

@@ -1,8 +1,81 @@
 use novacana_engine::{
     card::{Card, CardKind, StarName},
-    player::{GameView, Target, TargetOption},
+    player::{Action, GameView, Target, TargetOption},
     star_chart::SolarSystem,
 };
+
+// ── Decide candidate encoding ─────────────────────────────────────────────────
+//
+//  [0]  prompt: wormhole
+//  [1]  prompt: ignition
+//  [2]  prompt: athena
+//  [3]  prompt: shockwave
+//  [4]  prompt: cosmic denial
+//  [5]  prompt: dark matter void
+//  [6]  prompt: qef
+//  [7]  prompt: solar eclipse
+//  [8]  prompt: secretly choose (qef card swap)
+//  [9]  prompt: stellar nursery
+//  [10] prompt: astral projection / choose target opponent
+//  [11] prompt: other/unknown
+//
+//  [12] option: mentions "star chart" or "chart"
+//  [13] option: mentions "destroy"
+//  [14] option: mentions "gas giant"
+//  [15] option: mentions "pay" or "discard"
+//  [16] option: mentions "supernova"
+//  [17] option: mentions "blind" (random steal)
+//  [18] option: mentions "reveal"
+//  [19] dark matter class value / 6.0 (parsed from "Class N" in option text)
+//
+//  [20] my hand size / 10.0
+//  [21] any opponent has 2+ complete systems (approaching win)
+//
+//  [22] option_idx / total
+//  [23] option_count / 10.0
+
+pub fn encode_decide_candidate(
+    prompt: &str,
+    option: &str,
+    view: &GameView,
+    slot: usize,
+    total: usize,
+) -> [f32; CAND_DIM] {
+    let p = prompt.to_lowercase();
+    let o = option.to_lowercase();
+    let mut c = [0.0f32; CAND_DIM];
+
+    if      p.contains("wormhole")                                                   { c[0]  = 1.0; }
+    else if p.contains("ignition")                                                   { c[1]  = 1.0; }
+    else if p.contains("athena")                                                     { c[2]  = 1.0; }
+    else if p.contains("shockwave")                                                  { c[3]  = 1.0; }
+    else if p.contains("cosmic denial")                                              { c[4]  = 1.0; }
+    else if p.contains("dark matter")                                                { c[5]  = 1.0; }
+    else if p.contains("qef")                                                        { c[6]  = 1.0; }
+    else if p.contains("solar eclipse")                                              { c[7]  = 1.0; }
+    else if p.contains("secretly choose")                                            { c[8]  = 1.0; }
+    else if p.contains("stellar nursery")                                            { c[9]  = 1.0; }
+    else if p.contains("astral projection") || p.contains("choose target opponent") { c[10] = 1.0; }
+    else                                                                             { c[11] = 1.0; }
+
+    if o.contains("star chart") || o.contains("chart")      { c[12] = 1.0; }
+    if o.contains("destroy")                                 { c[13] = 1.0; }
+    if o.contains("gas giant")                               { c[14] = 1.0; }
+    if o.contains("pay") || o.contains("discard")            { c[15] = 1.0; }
+    if o.contains("supernova")                               { c[16] = 1.0; }
+    if o.contains("blind")                                   { c[17] = 1.0; }
+    if o.contains("reveal")                                  { c[18] = 1.0; }
+    for n in 2u8..=6 {
+        if o.contains(&format!("class {}", n)) { c[19] = n as f32 / 6.0; break; }
+    }
+
+    c[20] = view.my_hand.len() as f32 / 10.0;
+    c[21] = if view.opponents.iter().any(|op| op.star_chart.complete_systems().len() >= 2) { 1.0 } else { 0.0 };
+
+    c[22] = slot as f32 / (total as f32).max(1.0);
+    c[23] = total as f32 / 10.0;
+    c
+}
 
 use crate::feature::card_type_idx;
 
@@ -91,6 +164,65 @@ pub fn encode_system_candidate(sys: &SolarSystem, on_opponent: bool, slot: usize
     c[21] = if on_opponent { 1.0 } else { 0.0 };
     set_pos(&mut c, slot, total);
     c
+}
+
+// ── Encode a (discovery card, target system) pair (for the collapsed PlayDiscovery
+// abstract action — the candidate head jointly picks discovery type + target system)
+
+pub fn encode_discovery_candidate(card: &Card, sys: &SolarSystem, slot: usize, total: usize) -> [f32; CAND_DIM] {
+    let mut c = [0.0f32; CAND_DIM];
+    c[0] = 1.0; // is_hand_card
+    c[1] = 1.0; // is_system
+    c[5] = card_type_idx(&card.kind) as f32 / 28.0;
+    c[6]  = if matches!(&card.kind, CardKind::Star(_))      { 1.0 } else { 0.0 };
+    c[7]  = if matches!(&card.kind, CardKind::Discovery(_)) { 1.0 } else { 0.0 };
+    c[8]  = if matches!(&card.kind, CardKind::Flare(_))     { 1.0 } else { 0.0 };
+    c[9]  = if matches!(&card.kind, CardKind::Fracture(_))  { 1.0 } else { 0.0 };
+    c[10] = if matches!(&card.kind, CardKind::Omen(_))      { 1.0 } else { 0.0 };
+    c[11] = card.star_class().unwrap_or(0) as f32 / 6.0;
+    c[12] = star_name_to_idx(sys.star_name) as f32 / 6.0;
+    c[13] = sys.class as f32 / 6.0;
+    c[14] = sys.discoveries.len() as f32 / sys.class as f32;
+    c[15] = if sys.discoveries.len() + 1 >= sys.class as usize { 1.0 } else { 0.0 };
+    c[16] = if sys.is_eclipse_protected() { 1.0 } else { 0.0 };
+    set_pos(&mut c, slot, total);
+    c
+}
+
+// ── Shared disambiguation helper (used by every player that consults the
+// candidate head to pick a concrete action under an abstract index)
+
+pub fn encode_action_candidate(action: &Action, view: &GameView, slot: usize, total: usize) -> [f32; CAND_DIM] {
+    match action {
+        Action::PlayDiscovery { card: id, onto_star } => {
+            let card = view.my_hand.iter().find(|c| c.id == *id);
+            let sys  = view.my_star_chart.systems.iter().find(|s| s.star_id == *onto_star);
+            if let (Some(card), Some(sys)) = (card, sys) {
+                return encode_discovery_candidate(card, sys, slot, total);
+            }
+            let mut c = [0.0f32; CAND_DIM];
+            c[22] = slot as f32 / total as f32;
+            c[23] = total as f32 / 10.0;
+            c
+        }
+
+        Action::PlayStar(id) => {
+            if let Some(card) = view.my_hand.iter().find(|c| c.id == *id) {
+                return encode_card_candidate(card, slot, total);
+            }
+            let mut c = [0.0f32; CAND_DIM];
+            c[22] = slot as f32 / total as f32;
+            c[23] = total as f32 / 10.0;
+            c
+        }
+
+        _ => {
+            let mut c = [0.0; CAND_DIM];
+            c[22] = slot as f32 / total as f32;
+            c[23] = total as f32 / 10.0;
+            c
+        }
+    }
 }
 
 // ── Encode a TargetOption (for pick_targets)

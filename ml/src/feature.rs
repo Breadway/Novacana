@@ -4,11 +4,12 @@ use novacana_engine::{
     star_chart::StarChart,
 };
 
-pub const FEATURE_DIM: usize = 104;
+pub const FEATURE_DIM: usize = 162;
+const BASE_DIM: usize = 104;
 
-// ── Card-type index (0-28) ────────────────────────────────────────────────────
+// ── Card-type index (0-28), also used by candidate.rs ────────────────────────
 
-pub fn card_type_idx(kind: &CardKind) -> usize {  // also used by candidate.rs
+pub fn card_type_idx(kind: &CardKind) -> usize {
     match kind {
         CardKind::Star(StarName::Protostar)          =>  0,
         CardKind::Star(StarName::YellowDwarf)        =>  1,
@@ -42,8 +43,6 @@ pub fn card_type_idx(kind: &CardKind) -> usize {  // also used by candidate.rs
     }
 }
 
-// ── Star-type index (0-6, matching card_type_idx offsets 0-6) ────────────────
-
 fn star_idx(name: StarName) -> usize {
     match name {
         StarName::Protostar     => 0,
@@ -56,36 +55,21 @@ fn star_idx(name: StarName) -> usize {
     }
 }
 
-// ── Star chart helper ─────────────────────────────────────────────────────────
-
 fn encode_chart(chart: &StarChart, out: &mut [f32], base: usize) {
-    // [base+0]: complete_systems / 3.0
-    // [base+1]: incomplete_systems / 6.0
-    // [base+2..+9]: has_star_type (7 binary)
-    // [base+9]: overall fill fraction
-    // [base+10]: has eclipse protected
-    // [base+11]: approaching win (2+ complete)
-    let complete = chart.complete_systems();
+    let complete   = chart.complete_systems();
     let incomplete = chart.incomplete_systems();
-
     out[base]     = complete.len() as f32 / 3.0;
     out[base + 1] = incomplete.len() as f32 / 6.0;
-
     for sys in &chart.systems {
-        let si = star_idx(sys.star_name);
-        out[base + 2 + si] = 1.0;
+        out[base + 2 + star_idx(sys.star_name)] = 1.0;
     }
-
-    let (total_filled, total_needed): (usize, usize) = chart.systems.iter()
+    let (filled, needed): (usize, usize) = chart.systems.iter()
         .map(|s| (s.discoveries.len(), s.class as usize))
         .fold((0, 0), |(af, an), (f, n)| (af + f, an + n));
-    out[base + 9] = if total_needed > 0 { total_filled as f32 / total_needed as f32 } else { 0.0 };
-
+    out[base + 9]  = if needed > 0 { filled as f32 / needed as f32 } else { 0.0 };
     out[base + 10] = if chart.systems.iter().any(|s| s.is_eclipse_protected()) { 1.0 } else { 0.0 };
     out[base + 11] = if complete.len() >= 2 { 1.0 } else { 0.0 };
 }
-
-// ── Opponent features (12 per opponent) ──────────────────────────────────────
 
 fn encode_opponent(hand_size: usize, chart: &StarChart, out: &mut [f32], base: usize) {
     out[base]     = hand_size as f32 / 10.0;
@@ -94,81 +78,115 @@ fn encode_opponent(hand_size: usize, chart: &StarChart, out: &mut [f32], base: u
     out[base + 3] = if chart.complete_systems().len() >= 2 { 1.0 } else { 0.0 };
     out[base + 4] = if chart.systems.iter().any(|s| s.is_eclipse_protected()) { 1.0 } else { 0.0 };
     for sys in &chart.systems {
-        let si = star_idx(sys.star_name);
-        out[base + 5 + si] = 1.0;
+        out[base + 5 + star_idx(sys.star_name)] = 1.0;
     }
 }
 
-// ── Main encoder ──────────────────────────────────────────────────────────────
+// 104-feature snapshot matching v5 layout (base for v6 extension)
+fn encode_base(view: &GameView) -> [f32; BASE_DIM] {
+    let mut f = [0.0f32; BASE_DIM];
 
-pub fn encode(view: &GameView) -> [f32; FEATURE_DIM] {
-    let mut feat = [0.0f32; FEATURE_DIM];
-
-    // ── [0..29] My hand card-type counts (normalised /3) ─────────────────────
     for card in &view.my_hand {
-        let idx = card_type_idx(&card.kind);
-        feat[idx] += 1.0 / 3.0;
+        f[card_type_idx(&card.kind)] += 1.0 / 3.0;
     }
-
-    // ── [29..52] My star chart (23 features) ─────────────────────────────────
-    encode_chart(&view.my_star_chart, &mut feat, 29);
-
-    // Incomplete system fill fractions per star type [41..48]
+    encode_chart(&view.my_star_chart, &mut f, 29);
     for sys in view.my_star_chart.incomplete_systems() {
-        let si = star_idx(sys.star_name);
+        let si   = star_idx(sys.star_name);
         let fill = sys.discoveries.len() as f32 / sys.class as f32;
-        feat[41 + si] = fill.max(feat[41 + si]);
+        f[41 + si] = fill.max(f[41 + si]);
     }
-
-    // Supernova flags [48..52]
     let has_fusion  = view.my_hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaFusion)));
     let has_gravity = view.my_hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGravity)));
     let has_gas     = view.my_hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGas)));
-    feat[48] = if has_fusion  { 1.0 } else { 0.0 };
-    feat[49] = if has_gravity { 1.0 } else { 0.0 };
-    feat[50] = if has_gas     { 1.0 } else { 0.0 };
-    feat[51] = if has_fusion && has_gravity && has_gas
-                  && !view.my_star_chart.complete_systems().is_empty() { 1.0 } else { 0.0 };
+    f[48] = if has_fusion  { 1.0 } else { 0.0 };
+    f[49] = if has_gravity { 1.0 } else { 0.0 };
+    f[50] = if has_gas     { 1.0 } else { 0.0 };
+    f[51] = if has_fusion && has_gravity && has_gas
+               && !view.my_star_chart.complete_systems().is_empty() { 1.0 } else { 0.0 };
 
-    // ── [52..88] Opponents (up to 3 × 12 features) ───────────────────────────
     for (slot, opp) in view.opponents.iter().enumerate().take(3) {
-        let hand_size = if opp.hand_revealed.is_empty() { opp.hand_size } else { opp.hand_revealed.len() };
-        encode_opponent(hand_size, &opp.star_chart, &mut feat, 52 + slot * 12);
+        let hs = if opp.hand_revealed.is_empty() { opp.hand_size } else { opp.hand_revealed.len() };
+        encode_opponent(hs, &opp.star_chart, &mut f, 52 + slot * 12);
     }
 
-    // ── [88..96] Global state ─────────────────────────────────────────────────
-    feat[88] = view.deck_size as f32 / 90.0;
-    feat[89] = view.turn_number as f32 / 400.0;
-
+    f[88] = view.deck_size as f32 / 90.0;
+    f[89] = view.turn_number as f32 / 400.0;
     if let Some(class) = view.dark_matter_void {
-        feat[90] = 1.0;
-        if (2u8..=6).contains(&class) {
-            feat[90 + (class - 1) as usize] = 1.0;
+        f[90] = 1.0;
+        if (2u8..=6).contains(&class) { f[90 + (class - 1) as usize] = 1.0; }
+    }
+
+    f[96] = view.my_hand.len() as f32 / 7.0;
+    f[97] = if view.am_active() { 1.0 } else { 0.0 };
+    f[98] = view.opponents.len() as f32 / 3.0;
+    let best_opp = view.opponents.iter().map(|o| o.star_chart.complete_systems().len()).max().unwrap_or(0);
+    f[99]  = best_opp as f32 / 3.0;
+    f[100] = 1.0 - f[88];
+    f[101] = if view.my_hand.len() >= 5 { 1.0 } else { 0.0 };
+    f[102] = if view.my_star_chart.complete_systems().len() > best_opp { 1.0 } else { 0.0 };
+    f[103] = if view.deck_size == 0 { 1.0 } else { 0.0 };
+    f
+}
+
+fn card_category(kind: &CardKind) -> usize {
+    match kind {
+        CardKind::Star(_)      => 0,
+        CardKind::Discovery(_) => 1,
+        CardKind::Flare(_)     => 2,
+        CardKind::Fracture(_)  => 3,
+        CardKind::Omen(_)      => 4,
+    }
+}
+
+// ── Main encoder: 162-feature v6 snapshot ────────────────────────────────────
+
+pub fn encode(view: &GameView) -> [f32; FEATURE_DIM] {
+    let mut feat = [0.0f32; FEATURE_DIM];
+    feat[..BASE_DIM].copy_from_slice(&encode_base(view));
+
+    // [104..124] Play history: 4 seats × 5 card categories, counts /5.
+    // Seat-relative: row 0 = my plays, rows 1-3 = opponents[0..3] by their idx.
+    // The window is the last 20 global plays, so a single seat's count can
+    // exceed 5 — clamp instead of just scaling.
+    let mut history = [[0u8; 5]; 4];
+    for &(player_idx, ref kind) in &view.recent_plays {
+        let seat = if player_idx == view.my_idx {
+            Some(0)
+        } else {
+            view.opponents.iter().position(|o| o.idx == player_idx).map(|slot| slot + 1)
+        };
+        if let Some(seat) = seat {
+            history[seat][card_category(kind)] =
+                history[seat][card_category(kind)].saturating_add(1);
+        }
+    }
+    for seat in 0..4 {
+        for cat in 0..5 {
+            feat[104 + seat * 5 + cat] = (history[seat][cat] as f32 / 5.0).min(1.0);
         }
     }
 
-    // ── [96..104] Derived signals for the value head ──────────────────────────
-    // [96] My current hand size (distinct from type-count vector above).
-    feat[96] = view.my_hand.len() as f32 / 7.0;
-    // [97] Am I the active player this turn.
-    feat[97] = if view.am_active() { 1.0 } else { 0.0 };
-    // [98] Number of opponents (proxy for game size).
-    feat[98] = view.opponents.len() as f32 / 3.0;
-    // [99] Best opponent complete-system count (the strongest threat).
-    let best_opp_complete = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
-        .max()
-        .unwrap_or(0);
-    feat[99] = best_opp_complete as f32 / 3.0;
-    // [100] Game progress (inverse of deck remaining).
-    feat[100] = 1.0 - feat[88];
-    // [101] My hand is at or near the limit (pressure signal).
-    feat[101] = if view.my_hand.len() >= 5 { 1.0 } else { 0.0 };
-    // [102] I am leading in complete systems vs all opponents.
-    let my_complete = view.my_star_chart.complete_systems().len();
-    feat[102] = if my_complete > best_opp_complete { 1.0 } else { 0.0 };
-    // [103] Deck exhausted.
-    feat[103] = if view.deck_size == 0 { 1.0 } else { 0.0 };
+    // [124..133] Threat flags: 3 opponent slots × (has_flare, has_fracture, has_supernova)
+    for (slot, opp) in view.opponents.iter().enumerate().take(3) {
+        let oi = opp.idx;
+        let (mut hf, mut hfr, mut hs) = (false, false, false);
+        for &(pi, ref kind) in &view.recent_plays {
+            if pi != oi { continue; }
+            match kind {
+                CardKind::Flare(f) => { hf = true; if f.is_supernova() { hs = true; } }
+                CardKind::Fracture(_) => hfr = true,
+                _ => {}
+            }
+        }
+        feat[124 + slot * 3]     = if hf  { 1.0 } else { 0.0 };
+        feat[124 + slot * 3 + 1] = if hfr { 1.0 } else { 0.0 };
+        feat[124 + slot * 3 + 2] = if hs  { 1.0 } else { 0.0 };
+    }
+
+    // [133..162] Cumulative discard pile counts per card type /3
+    for (i, &count) in view.discard_pile_counts.iter().enumerate() {
+        feat[133 + i] = count as f32 / 3.0;
+    }
 
     feat
 }

@@ -23,7 +23,7 @@ impl ChainLink {
 
 /// The resolution queue for reactive plays.
 /// Links are resolved in LIFO order (last added = first resolved).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Chain {
     pub links: Vec<ChainLink>,
 }
@@ -103,6 +103,26 @@ impl fmt::Display for Chain {
         }
         Ok(())
     }
+}
+
+// ── Resume cursor ─────────────────────────────────────────────────────────────
+
+/// The exact position `GameEngine::run_chain_responses` had reached in its
+/// round-robin response window at the moment it asked a given player to
+/// respond. `start` is the seat the window began scanning from (the player
+/// left of whoever last added a link) and `consecutive_passes` is how many
+/// seats in a row have passed since then — together `(start +
+/// consecutive_passes) % n` is the responder currently being asked.
+///
+/// Passed into `Player::respond_to_chain_with_state` so a search-based player
+/// (see `ExpertCpuPlayer` in engine/src/cpu.rs) can hand the SAME cursor to
+/// `GameEngine::simulate_finish_chain`, which resumes the response window
+/// from this exact point instead of approximating it. Cheap `Copy` — no
+/// need to clone the whole chain/state just to carry this along.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainResumeCursor {
+    pub start: usize,
+    pub consecutive_passes: usize,
 }
 
 // ── Lightweight view for players ──────────────────────────────────────────────

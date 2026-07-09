@@ -7,15 +7,12 @@ edition = "2021"
 name = "novacana-ml"
 path = "src/main.rs"
 
-[[bin]]
-name = "novacana-ml-v6"
-path = "src/main_v6.rs"
-
 [dependencies]
 novacana-engine = { path = "../engine" }
-ndarray = { version = "0.15", features = ["blas"] }
-blas-src = { version = "0.10", default-features = false, features = ["openblas"] }
-openblas-src = { version = "0.10", features = ["system"] }
+# Pure-Rust matrixmultiply backend — deliberately NOT the ndarray "blas"
+# feature: system OpenBLAS's per-calling-thread buffer table overflows under
+# rayon ("precompiled NUM_THREADS exceeded") → heap corruption / SIGSEGV.
+ndarray = "0.15"
 ndarray-rand = "0.14"
 rand = "0.8"
 rayon = "1"
