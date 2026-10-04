@@ -653,6 +653,21 @@ pub fn average_gradients<B: Backend>(
     Ok(output)
 }
 
+/// Materialize every primary weight before cloning its parameter state.
+/// Burn 0.21 clones lazy initializers independently; matching IDs alone do
+/// not imply matching values until the source parameters are initialized.
+/// This reads tensor metadata, not tensor data, and retains fork-disjoint tapes.
+pub fn fork_bc_replica<B: Backend>(
+    net: &Net<B>,
+    device: &B::Device,
+) -> Result<(Net<B>, Vec<PairedSlot>), PairError> {
+    let primary_slots = float_param_slots(net);
+    pair_slots(&primary_slots, &primary_slots)?;
+    let replica = net.clone().fork(device);
+    let pairs = pair_slots(&primary_slots, &float_param_slots(&replica))?;
+    Ok((replica, pairs))
+}
+
 pub fn check_pair_ids<B: Backend>(
     net: &Net<B>,
     replica: &Net<B>,
@@ -913,15 +928,13 @@ pub fn bc_two_device_step<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
 
 /// Dense-layout, dropout-free gradient parity on three fork-disjoint graphs.
 /// Does not step Adam, change live weights, or write a checkpoint.
-#[cfg(feature = "tch")]
+#[cfg(any(test, feature = "tch"))]
 pub fn bc_parity<B: AutodiffBackend>(devices: &[B::Device]) -> Result<(), PairError> {
     assert_eq!(devices.len(), 2);
     B::seed(&devices[0], 42);
     let net = Net::<B>::fresh_with_dropout(&devices[0], 0.0);
-    let replica = net.clone().fork(&devices[1]);
-    let reference = net.clone().fork(&devices[0]);
-    let pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&replica))?;
-    let ref_pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&reference))?;
+    let (replica, pairs) = fork_bc_replica(&net, &devices[1])?;
+    let (reference, ref_pairs) = fork_bc_replica(&net, &devices[0])?;
     let samples = crate::recorder::benchmark_samples(42);
     assert!(!samples.is_empty());
     let batch: Vec<_> = samples.iter().cycle().take(4).collect();
@@ -1811,6 +1824,30 @@ mod bc_parallel_tests {
     }
 
     #[test]
+    fn freshly_forked_bc_models_have_identical_starting_weights() {
+        type B = Autodiff<NdArray>;
+        let device = NdArrayDevice::Cpu;
+        let net = Net::<B>::fresh_with_dropout(&device, 0.0);
+        // Call the production constructor before any other access to weights.
+        let (replica, pairs) = fork_bc_replica(&net, &device).unwrap();
+        let (reference, _) = fork_bc_replica(&net, &device).unwrap();
+        check_pair_ids(&net, &replica, &pairs).unwrap();
+        let a = download_f32(net.value_hidden.weight.val().inner());
+        let b = download_f32(replica.value_hidden.weight.val().inner());
+        let c = download_f32(reference.value_hidden.weight.val().inner());
+        assert_eq!(a.len(), b.len());
+        let replica_diff = a.iter().zip(&b).map(|(a, b)| (a-b).abs()).fold(0.0f32, f32::max);
+        let reference_diff = a.iter().zip(&c).map(|(a, b)| (a-b).abs()).fold(0.0f32, f32::max);
+        assert_eq!(replica_diff, 0.0, "replica weights differ before any forward");
+        assert_eq!(reference_diff, 0.0, "reference weights differ before any forward");
+    }
+
+    #[test]
+    fn cpu_split_gradients_match_the_unchanged_dense_parity_check() {
+        bc_parity::<Autodiff<NdArray>>(&[NdArrayDevice::Cpu, NdArrayDevice::Cpu]).unwrap();
+    }
+
+    #[test]
     fn full_model_paths_shapes_and_ids_pair_without_id_deduplication() {
         type B = Autodiff<NdArray>;
         let d = NdArrayDevice::Cpu;
@@ -1961,8 +1998,7 @@ mod bc_parallel_tests {
         type B = Autodiff<NdArray>;
         let d = NdArrayDevice::Cpu;
         let mut net = Net::<B>::fresh_with_dropout(&d, 0.0);
-        let mut replica = net.clone().fork(&d);
-        let pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&replica)).unwrap();
+        let (mut replica, pairs) = fork_bc_replica(&net, &d).unwrap();
         let mut opt = make_optimizer::<B>();
         use crate::tokens::{Token, SEQ_LEN};
         let mut seq = [Token {

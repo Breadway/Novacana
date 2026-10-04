@@ -176,7 +176,7 @@ Vulkan prints `device=DiscreteGpu(0)` (or whatever `vulkan_device()` returned) a
 - Data generation, val set, and `ExpertCpu` stay on the CPU, as now.
 - `let mut net = initial.unwrap_or_else(|| Net::fresh(&devices[0]));`
 - `let mut opt = net::make_optimizer::<B>();` once. This is the only Adam.
-- If `devices.len() == 2`: `let mut replica = net.clone().fork(&devices[1]);` once, before the first step, including after `--resume` / `--model` load. Load happens once, on device 0, in `cmd_bc`, exactly as today. Then fork. A bare `clone()` is not the replica.
+- If `devices.len() == 2`: call `net::fork_bc_replica(&net, &devices[1])` once, before the first step, including after `--resume` / `--model` load. It collects the primary slots first, materializing every lazy weight on device 0, then calls `clone().fork` and pairs the slots. Burn 0.21 clones an uninitialized parameter into an independent lazy initializer, so cloning before this materialization draws different weights even though the IDs match. Load happens once, on device 0, in `cmd_bc`, exactly as today. A bare `clone()` is not the replica.
 - Validation, `eval_win_rate`, and `spectator::record_spectator_game` keep using `net.valid()` and `devices[0]`. The second card is idle during those. That idle is accepted. Do not parallelize them in this change.
 - Checkpoints call `net.clone().save_file` (device 0 only). The sidecar stays `epoch`, `global_step`, `best_acc`. Adam state is still not saved.
 
@@ -398,7 +398,7 @@ pub fn pair_slots(a: &[ParamSlot], b: &[ParamSlot]) -> Result<Vec<PairedSlot>, P
 
 Build the `Vec<PairedSlot>` once, after the initial fork, and reuse it for every step. After the first broadcast, and again on debug builds every step, re-read ids and assert they still match the table. Do not compare tensor bytes there (that syncs).
 
-Initial replica: `net.clone().fork(&devices[1])`, then pair. `fork` is the right constructor because it copies weights and gives the replica its own autodiff graph (`Module::fork` docs, `burn-core-0.21.0/src/module/base.rs` lines 97-103). `float_detach` builds a new `AutodiffTensor` (`burn-autodiff-0.21.0/src/ops/tensor.rs` lines 1859-1871). Do not `Net::fresh` the replica. That would draw a second initialization. Do not use a bare `clone()` as the replica.
+Initial replica: `fork_bc_replica(&net, &devices[1])` materializes all primary weights via `float_param_slots` before `net.clone().fork(&devices[1])`, then pairs the initialized slots. This is tensor initialization and metadata inspection, with no host read of weight data. `fork` is the right constructor because it copies weights and gives the replica its own autodiff graph (`Module::fork` docs, `burn-core-0.21.0/src/module/base.rs` lines 97-103). `float_detach` builds a new `AutodiffTensor` (`burn-autodiff-0.21.0/src/ops/tensor.rs` lines 1859-1871). Do not `Net::fresh` the replica. That would draw a second initialization. Do not use a bare `clone()` as the replica.
 
 Broadcast after every Adam step, including the step that is about to checkpoint or shut down:
 
@@ -440,7 +440,7 @@ Conditions, all required:
 - One shared dense layout (`BatchLayout::dense()`) for both halves and for the reference forward. Compact per-slice layouts are out of this comparison.
 - Equal halves. Micro-batch `B = 2` is enough. Global reference batch is `4`. Use `recorder::benchmark_samples` or the same deterministic CPU fixture the compact tests use, duplicated out to 4 sequences if needed.
 - Seed with `B::seed(device, seed)` before `fresh_with_dropout`. `Backend::seed` is `seed(&Device, u64)`. There is no one-argument seed.
-- Same initial weights, three graphs. Build `net` on `Cuda(0)`. The replica is `net.clone().fork(&LibTorchDevice::Cuda(1))`. The reference is `net.clone().fork(&LibTorchDevice::Cuda(0))`, not a bare clone. `AutodiffTensor` is `#[derive(Clone)]` and the clone copies `NodeRef` (`burn-autodiff-0.21.0/src/tensor.rs` lines 13-17). `Param::clone` copies that tensor (`param/base.rs`, `val()` then `initialized(self.id, ...)`). A shared `NodeRef` aliases the autodiff client with device 0. `Module::fork` detaches into a new graph. Shared weight storage on the same device is acceptable for a grad-only compare: `TchOps::to_device` returns the same storage when the device matches. A shared `NodeRef` is not.
+- Same initial weights, three graphs. Build `net` on `Cuda(0)`. The replica and reference both use `fork_bc_replica`, on `Cuda(1)` and `Cuda(0)` respectively, so the primary weights are initialized once before either `clone().fork`. Neither is a bare clone. `AutodiffTensor` is `#[derive(Clone)]` and the clone copies `NodeRef` (`burn-autodiff-0.21.0/src/tensor.rs` lines 13-17). `Param::clone` copies the cached tensor only after initialization (`param/base.rs`). Before initialization it copies the lazy initializer into an independent state and preserves the ID, so matching IDs alone do not prove matching weights. A shared `NodeRef` aliases the autodiff client with device 0. `Module::fork` detaches into a new graph. Shared weight storage on the same device is acceptable for a grad-only compare: `TchOps::to_device` returns the same storage when the device matches. A shared `NodeRef` is not.
 - No `optim.step` on any of the three modules. Compare grads only.
 - Reference: one `bc_backward_layout` on all `2B` sequences, on the forked reference module.
 - Two-device side: the same overlapped scoped-thread pair used in training, then `weighted_average` with counts `B, B`. No host read before both threads join. The reference backward and the pair run on three graphs.
@@ -470,6 +470,8 @@ In `ml7/src/net.rs` tests, backend `Autodiff<NdArray>` / `NdArray`, device `NdAr
 - `clone().fork` onto the same CPU device: `pair_slots` succeeds and `ParamId`s match. This locks the burn 0.21 fact. The average must not skip the equal-id case.
 - Two rank-matched grads with the same `ParamId`, stored in two `GradientsParams`, still produce `(n0 * g0 + n1 * g1) / (n0 + n1)` through the remove-both, average, register-only-device-0 helper. A single-map `register` of the second id replaces the first, and that map's length stays 1. This is the bug a merge-then-`len() == 112` check would miss.
 - A unit test on hand-built `ParamSlot` lists: swapped paths, a dropped tail slot, and a dim mismatch all return `PairError`.
+- Fork a freshly created BC model through the production constructor before any other parameter access and require identical starting weights in the primary, replica, and reference.
+- Run the same dense-layout, dropout-free `bc_parity` calculation on CPU with two fork-disjoint micro-batches and the unchanged `1e-4` absolute and relative L2 thresholds.
 
 `resolve_bc_devices` tests live next to that function (a `#[cfg(test)]` module on the binary is fine): requested 1 with visible `Some(2)` returns 1; requested 2 with visible `Some(1)` errors and the message contains `Refusing`; requested 2 with visible `Some(2)` returns 2; requested 3 errors; requested 2 with `None` errors.
 

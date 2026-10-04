@@ -499,11 +499,13 @@ fn run_bc<B: AutodiffBackend>(
         phases.install_hook();
     }
     let mut net = initial.unwrap_or_else(|| Net::fresh(device));
-    let mut replica = (devices.len() == 2).then(|| net.clone().fork(&devices[1]));
-    let pairs = replica.as_ref().map(|r| {
-        net::pair_slots(&net::float_param_slots(&net), &net::float_param_slots(r))
-            .unwrap_or_else(|e| bc_fatal(e))
-    });
+    let (mut replica, pairs) = if devices.len() == 2 {
+        let (replica, pairs) = net::fork_bc_replica(&net, &devices[1])
+            .unwrap_or_else(|e| bc_fatal(e));
+        (Some(replica), Some(pairs))
+    } else {
+        (None, None)
+    };
     let mut broadcasts = 0usize;
     let mut opt = net::make_optimizer::<B>();
     let mut rng = thread_rng();
