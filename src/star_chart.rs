@@ -18,7 +18,7 @@ pub struct AttachedDiscovery {
 pub struct SolarSystem {
     pub star_id: CardId,
     pub star_name: StarName,
-    /// Discoveries needed to complete — equal to the star's class value.
+    /// Discoveries needed to complete - equal to the star's class value.
     pub class: u8,
     pub discoveries: Vec<AttachedDiscovery>,
     /// Solar Eclipse omen attached to this (completed) system.
@@ -81,7 +81,7 @@ impl fmt::Display for SolarSystem {
             format!("{}/{}", self.discoveries.len(), self.class)
         };
         let eclipse = if self.eclipse_id.is_some() { " [Eclipse]" } else { "" };
-        write!(f, "{} (Class {}){} — {}", self.star_name, self.class, eclipse, status)?;
+        write!(f, "{} (Class {}){} - {}", self.star_name, self.class, eclipse, status)?;
         for disc in &self.discoveries {
             let pol = if disc.planet_of_life_id.is_some() { " [Planet of Life]" } else { "" };
             write!(f, "\n    · {}{}", disc.name, pol)?;
@@ -141,7 +141,7 @@ impl StarChart {
     /// omens that survived (rules: "Omen cards remain in play"). Planet of Life omens
     /// are destroyed when their host Rocky Planet leaves, so they are included in `to_deck`.
     /// Drain the Star Chart for a board-wipe effect (Black Hole, Pulsar).
-    /// Eclipse-protected systems are completely untouched by any board wipe —
+    /// Eclipse-protected systems are completely untouched by any board wipe -
     /// the star, all discoveries, and the Solar Eclipse card all remain in place.
     /// Unprotected systems return their cards to the deck; Planet of Life is
     /// destroyed when its Rocky Planet host leaves.

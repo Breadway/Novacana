@@ -1,3 +1,12 @@
 [workspace]
 members = ["engine", "client", "server", "ml", "ml7"]
 resolver = "2"
+
+# Free compiler win for a branchy simulation hot loop (engine self-play) -
+# no behavior change, only compile time cost. Thin LTO instead of full/fat:
+# most of the win for a fraction of the link-time hit, matters since the
+# brother's PC rebuilds this from source (bootstrap.sh) rather than pulling
+# a prebuilt binary (Fable 5 consult, 2026-07-16).
+[profile.release]
+lto = "thin"
+codegen-units = 1

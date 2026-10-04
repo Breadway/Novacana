@@ -20,13 +20,13 @@ pub fn lookup(name: &str) -> Option<&'static CardEntry> {
     DB.get_or_init(build).get(&name.to_lowercase())
 }
 
-/// Returns a formatted string for the LLM: "NAME (Type, classN) — effect"
+/// Returns a formatted string for the LLM: "NAME (Type, classN) - effect"
 pub fn lookup_text(name: &str) -> Option<String> {
     lookup(name).map(|e| {
         let class_str = e.class_value
             .map(|c| format!(", class {}", c))
             .unwrap_or_default();
-        format!("{} ({}{}×{}) — {}", name, e.card_type, class_str, e.quantity, e.effect)
+        format!("{} ({}{}×{}) - {}", name, e.card_type, class_str, e.quantity, e.effect)
     })
 }
 

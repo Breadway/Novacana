@@ -2,7 +2,7 @@
 name = "novacana-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Game engine for Novacana — core library"
+description = "Game engine for Novacana - core library"
 
 [dependencies]
 rand = "0.8"

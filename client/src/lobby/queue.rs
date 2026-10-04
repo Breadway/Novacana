@@ -63,7 +63,7 @@ fn pick_size() -> io::Result<Option<u8>> {
                 .split(area);
 
             let title = Paragraph::new(Line::from(Span::styled(
-                "NOVACANA — Play",
+                "NOVACANA - Play",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center);

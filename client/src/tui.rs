@@ -143,12 +143,12 @@ impl TuiState {
 
 // ── Entry points ──────────────────────────────────────────────────────────────
 
-/// Pure observer — no human input; Q/Esc to quit.
+/// Pure observer - no human input; Q/Esc to quit.
 pub fn run_observer(rx: Receiver<GameEvent>) -> std::io::Result<()> {
     run_tui(rx, None)
 }
 
-/// Interactive — includes a HumanPlayer communicating through channels.
+/// Interactive - includes a HumanPlayer communicating through channels.
 ///
 /// SERVER PATH: `prompt_rx` becomes a WebSocket receiver and `response_tx`
 /// becomes a WebSocket sender. No changes to the game engine are needed.
@@ -259,7 +259,7 @@ fn run_tui(
 enum InputResult {
     /// Keep waiting.
     Pending,
-    /// Selection confirmed — close the input panel.
+    /// Selection confirmed - close the input panel.
     Done,
     /// User wants to quit entirely.
     Quit,
@@ -438,7 +438,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &TuiState, is_interactive: bo
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .title(Span::styled(
-                    " NOVACANA — GAME OVER ",
+                    " NOVACANA - GAME OVER ",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )));
         f.render_widget(para, area);
@@ -459,8 +459,8 @@ fn render_header(f: &mut Frame, area: Rect, state: &TuiState, is_interactive: bo
         let status = if let Some(input) = &state.input {
             let phase = match &input.prompt.kind {
                 PromptKind::ChooseAction { .. }   => "Action Phase",
-                PromptKind::RespondToChain { .. } => "Chain — respond?",
-                PromptKind::ChooseDiscard { .. }  => "End Phase — discard",
+                PromptKind::RespondToChain { .. } => "Chain - respond?",
+                PromptKind::ChooseDiscard { .. }  => "End Phase - discard",
                 PromptKind::Decide { .. }
                 | PromptKind::PickTarget { .. }   => "Effect resolving",
             };
@@ -487,7 +487,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &TuiState, is_interactive: bo
     };
 
     let title_label = if is_interactive {
-        " NOVACANA — INTERACTIVE  [? help] "
+        " NOVACANA - INTERACTIVE  [? help] "
     } else {
         " NOVACANA  [? help] "
     };
@@ -684,7 +684,7 @@ fn render_chain(f: &mut Frame, area: Rect, state: &TuiState) {
         ]))
     }).collect();
 
-    let title = format!(" CHAIN ({}) — resolves last-first ", links.len());
+    let title = format!(" CHAIN ({}) - resolves last-first ", links.len());
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
@@ -698,7 +698,7 @@ fn render_hand_panel(f: &mut Frame, area: Rect, hand: &[HandCardDisplay], playab
     // Name column is 24 chars, type tag column is 13 chars, rest goes to effect.
     const NAME_W: usize = 24;
     const TAG_W: usize  = 13;
-    const SEP: &str     = " — ";
+    const SEP: &str     = " - ";
     const LEAD: usize   = 2; // leading marker width
 
     let inner_w = area.width.saturating_sub(2) as usize; // subtract borders
@@ -742,7 +742,7 @@ fn render_hand_panel(f: &mut Frame, area: Rect, hand: &[HandCardDisplay], playab
     let title = if hand.is_empty() {
         " YOUR HAND ".to_string()
     } else if !playable.is_empty() {
-        format!(" YOUR HAND ({} cards — ► = has play) ", hand.len())
+        format!(" YOUR HAND ({} cards - ► = has play) ", hand.len())
     } else {
         format!(" YOUR HAND ({} cards) ", hand.len())
     };
@@ -812,7 +812,7 @@ fn render_input_panel(f: &mut Frame, area: Rect, state: &TuiState) {
         lines.push(Line::default());
     }
 
-    // Numbered options — colored by card type for ChooseAction, white for others
+    // Numbered options - colored by card type for ChooseAction, white for others
     for (i, opt) in options.iter().enumerate() {
         let is_sel = i == input.selected;
         let type_color = if let PromptKind::ChooseAction { action_types, .. } = kind {
@@ -847,7 +847,7 @@ fn render_input_panel(f: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().fg(Color::Yellow)
         };
         lines.push(Line::from(Span::styled(
-            "  [P] Pass — don't respond to the chain",
+            "  [P] Pass - don't respond to the chain",
             style,
         )));
     }
@@ -922,7 +922,7 @@ fn render_log(f: &mut Frame, area: Rect, state: &TuiState) {
         .collect();
 
     let title = if scroll > 0 || !state.log_pinned {
-        " EVENT LOG  [SCROLLED — G/End to resume] "
+        " EVENT LOG  [SCROLLED - G/End to resume] "
     } else if let Some(result) = &state.game_over {
         let cond = match result.condition {
             WinCondition::AstronomicalDomination => "Astronomical Domination",
@@ -935,7 +935,7 @@ fn render_log(f: &mut Frame, area: Rect, state: &TuiState) {
             ),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
-        " EVENT LOG — GAME OVER "
+        " EVENT LOG - GAME OVER "
     } else {
         " EVENT LOG  [Q quit · ↑/k scroll · ? help] "
     };

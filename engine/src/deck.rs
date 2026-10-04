@@ -1,7 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 
 use crate::card::{Card, CardId, CardKind, DiscoveryName, FlareName, FractureName, OmenName, StarName};
 
@@ -9,8 +9,15 @@ use crate::card::{Card, CardId, CardKind, DiscoveryName, FlareName, FractureName
 pub struct Deck {
     cards: Vec<Card>,
     next_id: CardId,
-    /// Permanent lookup: every card ever created, for reconstruction after Black Hole / Pulsar.
-    pub registry: HashMap<CardId, CardKind>,
+    /// Permanent lookup: every card ever created, for reconstruction after
+    /// Black Hole / Pulsar. Arc, not a plain HashMap: this is write-once
+    /// (only `add_many`, only during `build_classic`) and read-many -
+    /// `GameState::clone()` (which happens on the order of millions of
+    /// times across a single AZ iteration's MCTS playouts, see
+    /// `mcts.rs::leaf_value_choose_action`) used to deep-clone+rehash a
+    /// 90-entry HashMap every time; now it's a refcount bump (Fable 5
+    /// consult, 2026-07-16).
+    pub registry: Arc<HashMap<CardId, CardKind>>,
 }
 
 impl Deck {
@@ -19,7 +26,7 @@ impl Deck {
         let mut deck = Deck {
             cards: Vec::with_capacity(90),
             next_id: 1,
-            registry: HashMap::with_capacity(90),
+            registry: Arc::new(HashMap::with_capacity(90)),
         };
 
         // Stars (21)
@@ -69,7 +76,12 @@ impl Deck {
         for _ in 0..count {
             let id = self.next_id;
             self.next_id += 1;
-            self.registry.insert(id, kind.clone());
+            // Safe: add_many is private and only ever called from within
+            // build_classic(), before this Deck (and its registry Arc) is
+            // returned/cloned/shared anywhere - refcount is always 1 here.
+            Arc::get_mut(&mut self.registry)
+                .expect("registry must not be shared while add_many is still running")
+                .insert(id, kind.clone());
             self.cards.push(Card::new(id, kind.clone()));
         }
     }
@@ -80,7 +92,7 @@ impl Deck {
     }
 
     pub fn shuffle(&mut self) {
-        self.cards.shuffle(&mut thread_rng());
+        crate::random::with_rng(|rng| self.cards.shuffle(rng));
     }
 
     /// Draw from the top.
@@ -105,7 +117,7 @@ impl Deck {
 
     /// Shuffle a card back into the deck at a random position.
     pub fn shuffle_in(&mut self, card: Card) {
-        let pos = rand::random::<usize>() % (self.cards.len() + 1);
+        let pos = crate::random::random::<usize>() % (self.cards.len() + 1);
         self.cards.insert(pos, card);
     }
 
@@ -114,7 +126,7 @@ impl Deck {
         for c in cards {
             self.cards.push(c);
         }
-        self.cards.shuffle(&mut thread_rng());
+        crate::random::with_rng(|rng| self.cards.shuffle(rng));
     }
 
     /// Find and remove the first card matching the predicate, returning it.
@@ -152,14 +164,14 @@ impl Deck {
         for c in reordered.into_iter().rev() {
             self.cards.insert(0, c);
         }
-        // Place on bottom instead — rules say "place them on the bottom in any order"
+        // Place on bottom instead - rules say "place them on the bottom in any order"
         // So drain the top n, then push_bottom in desired order
     }
 
     /// Stellar Nursery Collapse: shuffle deck, privately view top 5, then push them
     /// to the bottom in a player-specified order.
     pub fn nursery_collapse(&mut self, ordered_ids: Vec<CardId>) {
-        self.cards.shuffle(&mut thread_rng());
+        crate::random::with_rng(|rng| self.cards.shuffle(rng));
         let n = 5.min(self.cards.len());
         let top: Vec<Card> = self.cards.drain(..n).collect();
         // Re-order per player choice

@@ -85,7 +85,7 @@ impl Player for WsHumanPlayer {
         if legal_responses.is_empty() { return None; }
         let chain_lines = chain.links.iter().map(|l| {
             let neg = if l.negated { " (NEGATED)" } else { "" };
-            format!("CL{} [{}] {} — {}{}", l.index + 1, l.player_name, l.card.kind.type_name(), l.card, neg)
+            format!("CL{} [{}] {} - {}{}", l.index + 1, l.player_name, l.card.kind.type_name(), l.card, neg)
         }).collect();
         let options = legal_responses.iter()
             .filter_map(|r| view.my_hand.iter().find(|c| c.id == r.card))

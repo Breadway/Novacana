@@ -1,4 +1,4 @@
-# Novacana ML — Architecture & Training Overview
+# Novacana ML - Architecture & Training Overview
 
 A deep-dive into how the Novacana AI was built, trained, and iterated from scratch. Covers everything from how the game state becomes a number array, through the neural network design, all the training techniques used across versions, and the planned v6 architecture.
 
@@ -17,13 +17,13 @@ A deep-dive into how the Novacana AI was built, trained, and iterated from scrat
 9. [Candidate Head Pretraining](#9-candidate-head-pretraining)
 10. [Reinforcement Learning](#10-reinforcement-learning)
 11. [REINFORCE (v1)](#11-reinforce-v1)
-12. [Proximal Policy Optimization — PPO (v2+)](#12-proximal-policy-optimization--ppo-v2)
-13. [Generalized Advantage Estimation — GAE (v5+)](#13-generalized-advantage-estimation--gae-v5)
+12. [Proximal Policy Optimization - PPO (v2+)](#12-proximal-policy-optimization--ppo-v2)
+13. [Generalized Advantage Estimation - GAE (v5+)](#13-generalized-advantage-estimation--gae-v5)
 14. [Shaped Rewards](#14-shaped-rewards)
 15. [Self-Play and the Snapshot Pool](#15-self-play-and-the-snapshot-pool)
 16. [AdvancedCpuPlayer Pool (v5+)](#16-advancedcpuplayer-pool-v5)
-17. [Monte Carlo Tree Search — MCTS](#17-monte-carlo-tree-search--mcts)
-18. [Population-Based Training — PBT](#18-population-based-training--pbt)
+17. [Monte Carlo Tree Search - MCTS](#17-monte-carlo-tree-search--mcts)
+18. [Population-Based Training - PBT](#18-population-based-training--pbt)
 19. [Version History and Results](#19-version-history-and-results)
 20. [v6 Roadmap](#20-v6-roadmap)
 
@@ -35,10 +35,10 @@ Novacana is a 2–4 player card game where players build star systems to win. Te
 
 The challenge is that the game is:
 
-- **Partially observable** — you can see your own hand but not opponents' hands
-- **Multi-player** — not a two-player zero-sum game, so there's no clean Nash equilibrium to converge to
-- **Long-horizon** — games can last 100+ turns, so a mistake early on doesn't show up in the reward until much later
-- **Combinatorial** — each card can be played onto different targets, making the concrete action space large
+- **Partially observable** - you can see your own hand but not opponents' hands
+- **Multi-player** - not a two-player zero-sum game, so there's no clean Nash equilibrium to converge to
+- **Long-horizon** - games can last 100+ turns, so a mistake early on doesn't show up in the reward until much later
+- **Combinatorial** - each card can be played onto different targets, making the concrete action space large
 
 ---
 
@@ -46,7 +46,7 @@ The challenge is that the game is:
 
 Before a neural network can do anything, the game state has to be turned into a fixed-size array of floats. This is called **feature engineering** and lives in `ml/src/feature.rs`.
 
-The encoder produces a `[f32; 104]` vector — 104 numbers — from a `GameView` (what one player can observe at decision time).
+The encoder produces a `[f32; 104]` vector - 104 numbers - from a `GameView` (what one player can observe at decision time).
 
 ### Feature layout
 
@@ -64,7 +64,7 @@ The encoder produces a `[f32; 104]` vector — 104 numbers — from a `GameView`
 
 **Normalisation.** Raw counts are divided by expected maximums (hand sizes by 3, complete systems by 3, turn number by 400). This keeps all values roughly in `[0, 1]`, which helps gradient-based optimisers converge.
 
-**Derived signals.** Features like "am I leading" (feature 102) and "approaching win" (feature 90) are redundant — they can be computed from other features — but they're included anyway. Neural networks can technically learn these combinations, but having them pre-computed makes the value head's job easier, especially early in training.
+**Derived signals.** Features like "am I leading" (feature 102) and "approaching win" (feature 90) are redundant - they can be computed from other features - but they're included anyway. Neural networks can technically learn these combinations, but having them pre-computed makes the value head's job easier, especially early in training.
 
 **Missing information.** The encoder does NOT capture game history. It's a pure snapshot: the model sees only the current state, not what cards opponents have played over the last 10 turns, or what was discarded. This is a key limitation addressed in v6.
 
@@ -72,13 +72,13 @@ The encoder produces a `[f32; 104]` vector — 104 numbers — from a `GameView`
 
 ## 3. The Abstract Action Space
 
-The game's concrete action space is large: you might be able to play a Discovery card onto any of several systems, each being a different concrete action. Instead of having the network reason over every concrete possibility, we define 35 **abstract actions** — one per strategic category — and handle the "which specific target" question separately (see [The Candidate Head](#5-the-candidate-head)).
+The game's concrete action space is large: you might be able to play a Discovery card onto any of several systems, each being a different concrete action. Instead of having the network reason over every concrete possibility, we define 35 **abstract actions** - one per strategic category - and handle the "which specific target" question separately (see [The Candidate Head](#5-the-candidate-head)).
 
 ```
  0        Pass
  1- 6     PlayStar       (YellowDwarf, RedGiant, RedSupergiant, WhiteDwarf, RedDwarf, BrownDwarf)
  7-11     PlayDiscovery  (AsteroidBelt, DwarfPlanet, RockyPlanet, GasGiant, Comet)
-12-17     PlaySolarSystem (same 6 star kinds — starting a NEW system vs extending)
+12-17     PlaySolarSystem (same 6 star kinds - starting a NEW system vs extending)
 18-22     PlayFlare      (StellarAlignment, CosmicDenial, Wormhole, Ignition, AstralProjection)
 23        PlaySupernovas
 24-30     PlayFracture   (BlackHole, Athena, Pulsar, DarkMatterVoid, QEF, SNC, Shockwave)
@@ -117,7 +117,7 @@ Input:  [f32; 104]   (game state features)
   │
   L4: Linear(256 → 128) + ReLU  ← bottleneck, no residual (dim changes)
   │
- [f32; 128]  ("body" output — shared by all heads)
+ [f32; 128]  ("body" output - shared by all heads)
 ```
 
 ### Heads (task-specific outputs)
@@ -178,7 +178,7 @@ The key insight: parameters that receive rare but large gradients get smaller ef
 
 ## 5. The Candidate Head
 
-The policy head decides *what type of card to play* (e.g., "play a Discovery card"). But there may be multiple concrete instantiations of that choice — which system to attach the Discovery to, or which star to play. These sub-decisions need to be resolved.
+The policy head decides *what type of card to play* (e.g., "play a Discovery card"). But there may be multiple concrete instantiations of that choice - which system to attach the Discovery to, or which star to play. These sub-decisions need to be resolved.
 
 The **candidate head** is a small auxiliary network that scores options against each other. It lives in `ml/src/candidate.rs` and `ml/src/net.rs`.
 
@@ -209,14 +209,14 @@ Each candidate option is encoded into a 24-float vector:
 
 ### Where the candidate head is used
 
-- **`choose_discards`** — scores each card in hand; discards the highest-scoring ones (model learns "which cards AdvCPU would discard")
-- **`pick_targets`** — scores each target option; picks the top N
-- **`decide`** — for binary/multi-choice card effects (e.g. Protostar: draw two vs. search), uses positional encoding since option text isn't available as features
-- **Concrete action disambiguation** in `choose_action` — when multiple concrete actions map to the same abstract action (e.g. PlayDiscovery(AsteroidBelt) onto system A vs. system B), scores each concrete option and returns the best
+- **`choose_discards`** - scores each card in hand; discards the highest-scoring ones (model learns "which cards AdvCPU would discard")
+- **`pick_targets`** - scores each target option; picks the top N
+- **`decide`** - for binary/multi-choice card effects (e.g. Protostar: draw two vs. search), uses positional encoding since option text isn't available as features
+- **Concrete action disambiguation** in `choose_action` - when multiple concrete actions map to the same abstract action (e.g. PlayDiscovery(AsteroidBelt) onto system A vs. system B), scores each concrete option and returns the best
 
 ### Why separate from the policy?
 
-The policy head is trained with RL signals — it needs to learn long-term strategic value. The candidate head is trained purely by imitation — it learns "what AdvCPU would do" at the sub-decision level. Keeping these separate avoids polluting the RL gradient with sub-decision noise, and allows the candidate head to be pretrained before RL begins.
+The policy head is trained with RL signals - it needs to learn long-term strategic value. The candidate head is trained purely by imitation - it learns "what AdvCPU would do" at the sub-decision level. Keeping these separate avoids polluting the RL gradient with sub-decision noise, and allows the candidate head to be pretrained before RL begins.
 
 ---
 
@@ -240,7 +240,7 @@ Each phase uses the same `models/net_v5.bin` file, updating it in place. The out
 
 **Goal:** give the network a sensible starting policy before RL begins.
 
-RL from random weights is extremely slow in complex games — the agent plays randomly for thousands of games before stumbling on any winning strategies. Imitation learning solves this by training the network to copy a known decent player (the `AdvancedCpuPlayer` heuristic bot).
+RL from random weights is extremely slow in complex games - the agent plays randomly for thousands of games before stumbling on any winning strategies. Imitation learning solves this by training the network to copy a known decent player (the `AdvancedCpuPlayer` heuristic bot).
 
 ### How it works
 
@@ -277,7 +277,7 @@ The downside: the network can only be as good as AdvCPU through imitation alone.
 
 ## 8. Value Head Pretraining
 
-After imitation, the value head is trained again in a dedicated **value pretraining** phase. This time, only the body and value head weights are updated — the policy head is left alone.
+After imitation, the value head is trained again in a dedicated **value pretraining** phase. This time, only the body and value head weights are updated - the policy head is left alone.
 
 ### Why a separate phase?
 
@@ -306,11 +306,11 @@ cand_loss = -log(score_probability[chosen_idx])
 where score_probabilities = softmax(candidate_head_scores for all K options)
 ```
 
-Crucially, only the candidate head layers (`lc1`, `lc2`) are updated. The body weights are frozen as context — the candidate head learns to read the game situation from the body output, but doesn't corrupt the body representation.
+Crucially, only the candidate head layers (`lc1`, `lc2`) are updated. The body weights are frozen as context - the candidate head learns to read the game situation from the body output, but doesn't corrupt the body representation.
 
 ### Why this matters (the v4 lesson)
 
-In v4, the `pretrain-candidates` step didn't exist yet when RL training started. The candidate head had random weights, so every `choose_discards`, `pick_targets`, and `decide` call during self-play made effectively random sub-decisions. This was far worse than AdvCPU's heuristics for those choices, and the noise from random sub-decisions corrupted the RL training signal so badly that v4 regressed all the way back to near-random (26.6%) — worse than v1 (24.5%).
+In v4, the `pretrain-candidates` step didn't exist yet when RL training started. The candidate head had random weights, so every `choose_discards`, `pick_targets`, and `decide` call during self-play made effectively random sub-decisions. This was far worse than AdvCPU's heuristics for those choices, and the noise from random sub-decisions corrupted the RL training signal so badly that v4 regressed all the way back to near-random (26.6%) - worse than v1 (24.5%).
 
 The fix in v5: always pretrain the candidate head before RL begins.
 
@@ -347,16 +347,16 @@ The intuition: if we won, increase the probability of every action we took (they
 
 **Problem:** REINFORCE has extremely high **variance**. In a 4-player game with 100+ decisions, most individual decisions have nearly zero impact on the final outcome. Assigning credit (or blame) equally to all decisions based on the final result is very noisy. A good play might be penalised because the team eventually lost; a bad play might be rewarded because it happened in a winning game.
 
-v1 used REINFORCE and achieved **24.5%** win rate — just below the 25% random baseline.
+v1 used REINFORCE and achieved **24.5%** win rate - just below the 25% random baseline.
 
 ---
 
-## 12. Proximal Policy Optimization — PPO (v2+)
+## 12. Proximal Policy Optimization - PPO (v2+)
 
 PPO is a more sophisticated RL algorithm that addresses two major problems with REINFORCE:
 
-1. **High variance** — solved with a value baseline (advantage estimation)
-2. **Unstable updates** — solved with clipped policy ratios
+1. **High variance** - solved with a value baseline (advantage estimation)
+2. **Unstable updates** - solved with clipped policy ratios
 
 ### Advantage estimation
 
@@ -368,8 +368,8 @@ advantage = return - V(state)
 
 Where `V(state)` is the value head's estimate of how good this state is. The advantage asks: "was this outcome *better or worse than expected*?" This dramatically reduces variance because:
 
-- If you're in a winning position (V=0.8) and you win (return=1.0), the advantage is only 0.2 — the win was expected
-- If you're in a losing position (V=0.2) and you win (return=1.0), the advantage is 0.8 — this was a surprisingly good outcome
+- If you're in a winning position (V=0.8) and you win (return=1.0), the advantage is only 0.2 - the win was expected
+- If you're in a losing position (V=0.2) and you win (return=1.0), the advantage is 0.8 - this was a surprisingly good outcome
 
 ### Clipped policy ratio
 
@@ -386,11 +386,11 @@ Then clips this ratio to `[1 - ε, 1 + ε]` (with ε=0.2) and uses the clipped o
 L_PPO = min(ratio × advantage,  clip(ratio, 1-ε, 1+ε) × advantage)
 ```
 
-If the ratio is already outside `[0.8, 1.2]` and trying to move further in the beneficial direction, the gradient is zeroed — no update. This acts as a **trust region**: don't take too large a policy step in any single update, because the data was collected under the old policy and might not be representative anymore.
+If the ratio is already outside `[0.8, 1.2]` and trying to move further in the beneficial direction, the gradient is zeroed - no update. This acts as a **trust region**: don't take too large a policy step in any single update, because the data was collected under the old policy and might not be representative anymore.
 
 ### Multiple epochs per batch
 
-Unlike REINFORCE which makes one gradient pass per batch of experience, PPO reuses each batch for **4 gradient passes**. This improves sample efficiency — you extract more learning signal from the same games — while the clipping prevents over-fitting to any particular batch.
+Unlike REINFORCE which makes one gradient pass per batch of experience, PPO reuses each batch for **4 gradient passes**. This improves sample efficiency - you extract more learning signal from the same games - while the clipping prevents over-fitting to any particular batch.
 
 ### Entropy bonus
 
@@ -400,11 +400,11 @@ An entropy term is added to the loss:
 entropy = -Σ p(a) × log p(a)    (Shannon entropy over action probabilities)
 ```
 
-Maximising entropy encourages the policy to stay exploratory — not collapse to always playing the same few actions. Without this, the policy can prematurely converge to a suboptimal strategy.
+Maximising entropy encourages the policy to stay exploratory - not collapse to always playing the same few actions. Without this, the policy can prematurely converge to a suboptimal strategy.
 
 ---
 
-## 13. Generalized Advantage Estimation — GAE (v5+)
+## 13. Generalized Advantage Estimation - GAE (v5+)
 
 GAE is a technique for computing lower-variance advantage estimates. It addresses the fundamental trade-off between bias and variance in return estimation.
 
@@ -435,7 +435,7 @@ In a Novacana game with 100 decisions, a plain discounted return of γ^99 ≈ 0.
 
 ## 14. Shaped Rewards
 
-The game's natural reward is 1.0 for winning and 0.0 for losing — delivered only at game end. With 100+ decisions per game and γ=0.99, rewards from early decisions are heavily discounted. To give the network denser feedback, **shaped rewards** are added at intermediate steps:
+The game's natural reward is 1.0 for winning and 0.0 for losing - delivered only at game end. With 100+ decisions per game and γ=0.99, rewards from early decisions are heavily discounted. To give the network denser feedback, **shaped rewards** are added at intermediate steps:
 
 | Event | Reward |
 |-------|--------|
@@ -443,7 +443,7 @@ The game's natural reward is 1.0 for winning and 0.0 for losing — delivered on
 | Crossing the 3-system win threshold | +0.15 bonus |
 | Opponent completes a system | −0.05 |
 
-These are heuristic and require care — aggressive shaping can cause reward hacking (the agent optimises for intermediate rewards instead of actually winning). The magnitudes here are kept small relative to the final 1.0/0.0 outcome so the net strategic goal isn't distorted.
+These are heuristic and require care - aggressive shaping can cause reward hacking (the agent optimises for intermediate rewards instead of actually winning). The magnitudes here are kept small relative to the final 1.0/0.0 outcome so the net strategic goal isn't distorted.
 
 ---
 
@@ -473,7 +473,7 @@ The purpose is to maintain **baseline pressure**. Early in RL training, snapshot
 
 ---
 
-## 17. Monte Carlo Tree Search — MCTS
+## 17. Monte Carlo Tree Search - MCTS
 
 MCTS is a search algorithm used at evaluation time (and in v6, at training time). It's available via the `--mcts N` flag when running `eval`.
 
@@ -490,11 +490,11 @@ At each decision, instead of immediately picking the highest-probability action,
 
 3. **Backpropagation**: record whether the simulation resulted in a win for our player; update the action's visit count and value estimate
 
-4. **Final selection**: pick the action with the **most visits** (not highest estimated value — visits are more robust to outliers)
+4. **Final selection**: pick the action with the **most visits** (not highest estimated value - visits are more robust to outliers)
 
 ### Perfect Information Monte Carlo (PIMC)
 
-Because opponent hands are hidden, MCTS can't clone the *true* game state — it only has `GameView`. The approach used is **determinization**: sample plausible hidden cards for opponents (uniform over unseen cards), run the simulation in that hypothetical world, and average over many such worlds. This is approximate but works well in practice.
+Because opponent hands are hidden, MCTS can't clone the *true* game state - it only has `GameView`. The approach used is **determinization**: sample plausible hidden cards for opponents (uniform over unseen cards), run the simulation in that hypothetical world, and average over many such worlds. This is approximate but works well in practice.
 
 ### MCTS vs pure policy
 
@@ -505,7 +505,7 @@ MCTS is slower (each decision requires N full game simulations) but stronger. It
 
 ---
 
-## 18. Population-Based Training — PBT
+## 18. Population-Based Training - PBT
 
 PBT trains a **population** of N agents in parallel, periodically replacing the worst-performing agents with perturbed copies of the best-performing ones.
 
@@ -522,13 +522,13 @@ Every 20 iterations:
 Perturbation: multiply each weight by (1 + ε), where ε ~ Uniform[-0.02, 0.02]
 ```
 
-PBT serves as automatic hyperparameter tuning — well-performing agents' hyperparameters (learning rate, temperature, etc.) are inherited by the population, and small perturbations explore nearby hyperparameter space. It also naturally maintains diversity: different agents specialise in different strategies, and their games against each other provide richer training signal than any single agent playing alone.
+PBT serves as automatic hyperparameter tuning - well-performing agents' hyperparameters (learning rate, temperature, etc.) are inherited by the population, and small perturbations explore nearby hyperparameter space. It also naturally maintains diversity: different agents specialise in different strategies, and their games against each other provide richer training signal than any single agent playing alone.
 
 ---
 
 ## 19. Version History and Results
 
-### v1 — REINFORCE baseline (24.5%)
+### v1 - REINFORCE baseline (24.5%)
 
 **Architecture:** 104 → 256 → 256 → 256 → 128 → {35, 1}
 
@@ -538,15 +538,15 @@ PBT serves as automatic hyperparameter tuning — well-performing agents' hyperp
 
 ---
 
-### v2 — Value pretraining (45%)
+### v2 - Value pretraining (45%)
 
 **What changed:** Added a dedicated value pretraining phase before RL.
 
-**Why it worked:** A pretrained value head dramatically reduces RL variance. With an accurate `V(s)`, the advantage `return − V(s)` is small for expected outcomes and large only for surprising ones — exactly the signal we want. This single addition jumped performance from 24.5% to ~45%, close to beating AdvCPU (which would be >50%).
+**Why it worked:** A pretrained value head dramatically reduces RL variance. With an accurate `V(s)`, the advantage `return − V(s)` is small for expected outcomes and large only for surprising ones - exactly the signal we want. This single addition jumped performance from 24.5% to ~45%, close to beating AdvCPU (which would be >50%).
 
 ---
 
-### v3 — PPO + shaped rewards + snapshot pool (43.8%)
+### v3 - PPO + shaped rewards + snapshot pool (43.8%)
 
 **What changed:** Replaced REINFORCE with PPO. Added shaped rewards. Added snapshot pool.
 
@@ -554,17 +554,17 @@ PBT serves as automatic hyperparameter tuning — well-performing agents' hyperp
 
 ---
 
-### v4 — Candidate head (26.6% — regression)
+### v4 - Candidate head (26.6% - regression)
 
 **What changed:** Added the candidate head architecture and wired it into all sub-decisions (`choose_discards`, `pick_targets`, `decide`).
 
-**What went wrong:** The `pretrain-candidates` step didn't exist yet when v4's RL training started. The candidate head had **random weights** and was actively used for every discard, target, and decide call during self-play. Random sub-decisions are significantly worse than AdvCPU's heuristics for those choices, generating extremely noisy training data. The RL signal was so corrupted that the model regressed from 43.8% all the way to 26.6% — worse than v1.
+**What went wrong:** The `pretrain-candidates` step didn't exist yet when v4's RL training started. The candidate head had **random weights** and was actively used for every discard, target, and decide call during self-play. Random sub-decisions are significantly worse than AdvCPU's heuristics for those choices, generating extremely noisy training data. The RL signal was so corrupted that the model regressed from 43.8% all the way to 26.6% - worse than v1.
 
 **The lesson:** always pretrain sub-decision heads before RL. Never run a randomly-initialised head in the hot path of self-play.
 
 ---
 
-### v5 — Correct pretraining order (in progress)
+### v5 - Correct pretraining order (in progress)
 
 **What changed:**
 - **Candidate pretraining step** added before RL (the v4 fix)
@@ -602,13 +602,13 @@ Add historical information to the per-decision snapshot in `feature.rs`:
 - Binary flags: has each opponent played a Flare / Fracture / Supernova yet in this game
 - Discard pile composition summary
 
-This is purely additive — no architecture changes, just a wider input. It gives the model access to information human players actively track ("opponent has already played their Wormhole, so they can't respond to my chain").
+This is purely additive - no architecture changes, just a wider input. It gives the model access to information human players actively track ("opponent has already played their Wormhole, so they can't respond to my chain").
 
 ### Change 2: Stacked recent states (3 × feature_dim input)
 
 Instead of a single 160-feature snapshot, concatenate the last 3 encoded game states as the network input (~480 floats). This gives the MLP temporal awareness without needing recurrence.
 
-The rolling state buffer is maintained in `RecordingPlayer` and `SelfPlayPlayer` — each player tracks their last 3 states, and the oldest is dropped when a new one arrives.
+The rolling state buffer is maintained in `RecordingPlayer` and `SelfPlayPlayer` - each player tracks their last 3 states, and the oldest is dropped when a new one arrives.
 
 A full recurrent architecture (LSTM/GRU) or transformer over the event log would be more expressive but significantly harder to train and would require GPU acceleration to run at speed. Stacked states is a practical middle ground: simple to implement, provides temporal context, stays within the existing MLP framework.
 
@@ -624,7 +624,7 @@ At this scale, GPU training becomes worthwhile. The current 256-wide network on 
 
 ### Change 4: AlphaZero-style training loop
 
-This is the highest-impact change. Currently, PPO learns from win/loss outcomes — a sparse signal delivered at the end of a 100+ turn game. AlphaZero learns from **MCTS visit distributions** — a dense signal at every single decision.
+This is the highest-impact change. Currently, PPO learns from win/loss outcomes - a sparse signal delivered at the end of a 100+ turn game. AlphaZero learns from **MCTS visit distributions** - a dense signal at every single decision.
 
 The AlphaZero training loop works as follows:
 
@@ -638,7 +638,7 @@ The AlphaZero training loop works as follows:
    loss = -Σ target_policy[a] × log network_policy[a]    (KL divergence)
    ```
 
-3. **Value training:** unchanged — predict win probability from the game outcome
+3. **Value training:** unchanged - predict win probability from the game outcome
 
 Why this is so powerful: MCTS is a **policy improvement operator**. Given a policy π, running MCTS produces a better policy π' (the visit distribution). Training the network to match π' makes the next generation of MCTS even better. This recursive self-improvement is why AlphaZero-style approaches achieved superhuman play in Go and Chess.
 
@@ -654,7 +654,7 @@ The key difference from standard PPO: every decision in every game provides a fu
 | 512-wide network | +2–5% |
 | **Combined target** | **55–65%** |
 
-Beating AdvancedCpuPlayer consistently (>50% win rate against 3 of them) is the first milestone. Beyond that, the ceiling is set by the fundamental difficulty of multi-player imperfect-information games — there's no Nash equilibrium to converge to the way there is in two-player zero-sum games like Chess or Go.
+Beating AdvancedCpuPlayer consistently (>50% win rate against 3 of them) is the first milestone. Beyond that, the ceiling is set by the fundamental difficulty of multi-player imperfect-information games - there's no Nash equilibrium to converge to the way there is in two-player zero-sum games like Chess or Go.
 
 ### What v7 might look like
 

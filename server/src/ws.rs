@@ -146,7 +146,7 @@ async fn handle_client_msg(
             let _ = response_tx.send(response);
         }
 
-        // Invalid messages for current state — silently ignore.
+        // Invalid messages for current state - silently ignore.
         _ => {}
     }
 }

@@ -151,7 +151,7 @@ impl Deck {
         for c in reordered.into_iter().rev() {
             self.cards.insert(0, c);
         }
-        // Place on bottom instead — rules say "place them on the bottom in any order"
+        // Place on bottom instead - rules say "place them on the bottom in any order"
         // So drain the top n, then push_bottom in desired order
     }
 

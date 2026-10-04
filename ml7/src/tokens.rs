@@ -3,10 +3,10 @@
 // Every token is `embed(type) + sum(embed(field_i))`. There is one shared
 // vocabulary of learned embeddings: one table for `type_id` (TYPE_VOCAB rows)
 // and NUM_FIELDS tables for the generic field slots (FIELD_VOCAB rows each,
-// reused across token types — the network disambiguates a field's meaning
+// reused across token types - the network disambiguates a field's meaning
 // from the type embedding it's added to). This keeps the embedding surface
-// small (8 tables total) while letting every token category — state, history,
-// and *all five* decision kinds folded into one action-token shape — share
+// small (8 tables total) while letting every token category - state, history,
+// and *all five* decision kinds folded into one action-token shape - share
 // the same encode/decode plumbing.
 //
 // Sequence layout is FIXED-OFFSET, not densely packed: state tokens always
@@ -15,7 +15,7 @@
 // [STATE_MAX + HISTORY_MAX, SEQ_LEN). Unused slots within a block are filled
 // with Pad tokens. This means the action-token block for every sample in a
 // batch starts at the same tensor offset, so net.rs can `narrow()` it out
-// without any per-sample gather — and the padding mask for the encoder AND
+// without any per-sample gather - and the padding mask for the encoder AND
 // the legal-action mask for the pointer head are both directly derivable
 // from `type_id == TokenType::Pad`, so EncodedSample doesn't need to carry
 // separate mask arrays at all.
@@ -62,7 +62,7 @@ pub const TYPE_VOCAB: usize = 8;
 // ── Action-kind vocabulary (stored in an Action token's field[0]) ────────
 //
 // Unifies all five decision kinds (choose_action, chain response, decide,
-// pick_targets, choose_discards) into one token shape — this is the entire
+// pick_targets, choose_discards) into one token shape - this is the entire
 // point of the pointer-policy design (ASTRA7.md §3.1): the decision *kind*
 // lives in the action tokens, not in a separate abstract-action space.
 
@@ -90,7 +90,7 @@ pub enum ActionKind {
 pub const NUM_ACTION_KINDS: usize = 16;
 
 /// Human-readable name for a raw ActionKind byte (as stored in an action
-/// token's fields[0]) — used by the per-kind fidelity diagnostic
+/// token's fields[0]) - used by the per-kind fidelity diagnostic
 /// (ASTRA7.md §1.1/§10: is chain-response fidelity lagging other kinds?).
 pub fn action_kind_name(kind: u8) -> &'static str {
     match kind {
@@ -119,7 +119,7 @@ pub fn action_kind_name(kind: u8) -> &'static str {
 #[derive(Debug, Clone, Copy)]
 pub struct Token {
     pub ttype: u8,
-    pub fields: [u16; NUM_FIELDS],
+    pub fields: [u8; NUM_FIELDS],
 }
 
 impl Token {
@@ -139,11 +139,11 @@ fn pad_seq() -> TokenSeq {
 
 // ── Field bucket helpers (shared by state, history, and action encoders) ──
 
-fn card_type_field(kind: &CardKind) -> u16 {
-    kind.type_idx() as u16 // engine-stable 0..28
+fn card_type_field(kind: &CardKind) -> u8 {
+    kind.type_idx() as u8 // engine-stable 0..28
 }
 
-fn star_type_field(name: StarName) -> u16 {
+fn star_type_field(name: StarName) -> u8 {
     match name {
         StarName::Protostar => 0,
         StarName::YellowDwarf => 1,
@@ -156,7 +156,7 @@ fn star_type_field(name: StarName) -> u16 {
 }
 
 // 0 = not applicable/no class (Protostar), 1..5 = class 2..6.
-fn class_bucket(class: u8) -> u16 {
+fn class_bucket(class: u8) -> u8 {
     match class {
         2 => 1,
         3 => 2,
@@ -168,38 +168,38 @@ fn class_bucket(class: u8) -> u16 {
 }
 
 // 0..6: number of discoveries currently filled (clamped to class).
-fn fill_bucket(filled: usize, class: u8) -> u16 {
-    (filled.min(class as usize)) as u16
+fn fill_bucket(filled: usize, class: u8) -> u8 {
+    (filled.min(class as usize)) as u8
 }
 
-fn bool_field(b: bool) -> u16 {
-    b as u16
+fn bool_field(b: bool) -> u8 {
+    b as u8
 }
 
-fn clip_bucket(v: usize, max: usize) -> u16 {
-    v.min(max) as u16
+fn clip_bucket(v: usize, max: usize) -> u8 {
+    v.min(max) as u8
 }
 
 /// Relative seat: 0 = me, 1..=3 = opponent slot (position in `view.opponents`) + 1.
-/// Absolute seat indices are useless across games (v6 bug, ASTRA7.md §3.1) —
+/// Absolute seat indices are useless across games (v6 bug, ASTRA7.md §3.1) -
 /// always resolve through the viewer's own perspective.
-fn relative_seat(view: &GameView, player_idx: usize) -> u16 {
+fn relative_seat(view: &GameView, player_idx: usize) -> u8 {
     if player_idx == view.my_idx {
         0
     } else {
         view.opponents
             .iter()
             .position(|o| o.idx == player_idx)
-            .map(|slot| slot as u16 + 1)
+            .map(|slot| slot as u8 + 1)
             .unwrap_or(0)
     }
 }
 
-fn star_name_to_idx(name: StarName) -> u16 {
+fn star_name_to_idx(name: StarName) -> u8 {
     star_type_field(name)
 }
 
-// ── State tokens (a set — no positional encoding) ─────────────────────────
+// ── State tokens (a set - no positional encoding) ─────────────────────────
 
 pub fn encode_state_tokens(view: &GameView) -> Vec<Token> {
     let mut out = Vec::with_capacity(STATE_MAX);
@@ -228,22 +228,22 @@ pub fn encode_state_tokens(view: &GameView) -> Vec<Token> {
     // Opponents + their systems
     for (slot, opp) in view.opponents.iter().enumerate().take(STATE_OPP_MAX) {
         let mut t = Token::new(TokenType::Opponent);
-        t.fields[0] = slot as u16 + 1;
+        t.fields[0] = slot as u8 + 1;
         t.fields[1] = clip_bucket(opp.hand_size, 10);
-        let complete = opp.star_chart.complete_systems().len();
+        let complete = opp.star_chart.complete_count();
         t.fields[2] = clip_bucket(complete, 3);
         t.fields[3] = bool_field(complete >= 2);
         out.push(t);
 
         for sys in opp.star_chart.systems.iter().take(STATE_OPP_SYS_MAX) {
-            out.push(encode_system_token(sys, TokenType::OppSystem, slot as u16 + 1));
+            out.push(encode_system_token(sys, TokenType::OppSystem, slot as u8 + 1));
         }
     }
 
     out
 }
 
-fn encode_system_token(sys: &SolarSystem, ttype: TokenType, opp_slot: u16) -> Token {
+fn encode_system_token(sys: &SolarSystem, ttype: TokenType, opp_slot: u8) -> Token {
     let mut t = Token::new(ttype);
     t.fields[0] = star_name_to_idx(sys.star_name);
     t.fields[1] = class_bucket(sys.class);
@@ -269,7 +269,7 @@ fn encode_system_token(sys: &SolarSystem, ttype: TokenType, opp_slot: u16) -> To
 // card-type is still real signal, and event_type field[0] is reserved
 // (currently always 0 = "play") so a future pass can add the richer
 // taxonomy from ASTRA7.md §3.1 (system-complete/destroy/discard-visible/
-// omen-attach) purely by widening this encoder — no token-schema migration
+// omen-attach) purely by widening this encoder - no token-schema migration
 // needed downstream.
 pub fn encode_history_tokens(view: &GameView) -> Vec<Token> {
     let n = view.recent_plays.len().min(HISTORY_MAX);
@@ -288,7 +288,7 @@ pub fn encode_history_tokens(view: &GameView) -> Vec<Token> {
 
 // ── Decide-prompt taxonomy (reused from v6 candidate.rs keyword buckets) ──
 
-fn prompt_type_bucket(prompt: &str) -> u16 {
+fn prompt_type_bucket(prompt: &str) -> u8 {
     let p = prompt.to_lowercase();
     if p.contains("wormhole") {
         1
@@ -318,9 +318,9 @@ fn prompt_type_bucket(prompt: &str) -> u16 {
 }
 
 // 6 boolean keyword flags packed into one 0..63 field.
-fn option_flags_bucket(option: &str) -> u16 {
+fn option_flags_bucket(option: &str) -> u8 {
     let o = option.to_lowercase();
-    let mut bits: u16 = 0;
+    let mut bits: u8 = 0;
     if o.contains("star chart") || o.contains("chart") {
         bits |= 1 << 0;
     }
@@ -342,40 +342,65 @@ fn option_flags_bucket(option: &str) -> u16 {
     bits
 }
 
-// ── Action-token encoders — one per decision kind, all emitting the same
+// ── Action-token encoders - one per decision kind, all emitting the same
 // `Token` shape so the pointer head is decision-kind-agnostic. ─────────────
 
-/// choose_action: one token per legal concrete `Action` — no abstraction
+/// choose_action: one token per legal concrete `Action` - no abstraction
 /// layer, unlike v6. Target index == the chosen index into `legal` directly.
 pub fn encode_action_tokens_choose_action(view: &GameView, legal: &[Action]) -> Vec<Token> {
     legal.iter().map(|a| encode_one_action(view, a)).collect()
 }
 
 // Finds the system containing `card_id` either as its star or as one of its
-// attached discoveries — covers both PlayDiscovery's `onto_star` (a star id)
+// attached discoveries - covers both PlayDiscovery's `onto_star` (a star id)
 // and PlayOmen::PlanetOfLife's `rocky_planet_disc` (a discovery id).
-fn find_system_containing<'a>(view: &'a GameView, card_id: CardId) -> Option<&'a SolarSystem> {
+/// Same lookup, plus a stable position index across (my systems, then each
+/// opponent's systems, in order) - disambiguates two legal actions whose
+/// target systems bucket identically (same star_name/class/fill) but are
+/// actually different systems. Found 2026-07-09 via the AdvCPU-training-
+/// distribution collision scan: PlayOmenEclipse/PlayDiscovery collided this
+/// way even after the hand-slot-index fix, since that fix only disambiguates
+/// WHICH CARD is played, not WHICH TARGET it's played onto.
+fn find_system_containing_with_pos<'a>(view: &'a GameView, card_id: CardId) -> Option<(&'a SolarSystem, usize)> {
     let hit = |sys: &&SolarSystem| {
         sys.star_id == card_id || sys.discoveries.iter().any(|d| d.card_id == card_id)
     };
-    if let Some(s) = view.my_star_chart.systems.iter().find(hit) {
-        return Some(s);
+    if let Some(pos) = view.my_star_chart.systems.iter().position(|s| hit(&s)) {
+        return Some((&view.my_star_chart.systems[pos], pos));
     }
-    view.opponents.iter().find_map(|o| o.star_chart.systems.iter().find(hit))
+    let mut base = view.my_star_chart.systems.len();
+    for o in &view.opponents {
+        if let Some(pos) = o.star_chart.systems.iter().position(|s| hit(&s)) {
+            return Some((&o.star_chart.systems[pos], base + pos));
+        }
+        base += o.star_chart.systems.len();
+    }
+    None
 }
 
 fn hand_card<'a>(view: &'a GameView, id: CardId) -> Option<&'a Card> {
     view.my_hand.iter().find(|c| c.id == id)
 }
 
+fn hand_card_slot(view: &GameView, id: CardId) -> Option<usize> {
+    view.my_hand.iter().position(|c| c.id == id)
+}
+
+// field[6] = hand-slot index of the card this action plays (found
+// 2026-07-09 via the token-collision scan, live-play only - every variant
+// below previously encoded card TYPE via card_type_field but never card
+// IDENTITY, so two legal actions playing different copies of the same card
+// type collided into an identical token. 10.4% of live-play decisions hit
+// this in testing. field[6] is unused by every variant here, safe to add
+// uniformly. Same fix shape as encode_one_target's HandCard branch.
 fn encode_one_action(view: &GameView, action: &Action) -> Token {
     let mut t = Token::new(TokenType::Action);
     match action {
         Action::Pass => {
-            t.fields[0] = ActionKind::Pass as u16;
+            t.fields[0] = ActionKind::Pass as u8;
         }
         Action::PlayStar(id) => {
-            t.fields[0] = ActionKind::PlayStar as u16;
+            t.fields[0] = ActionKind::PlayStar as u8;
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
                 if let CardKind::Star(name) = &card.kind {
@@ -385,48 +410,112 @@ fn encode_one_action(view: &GameView, action: &Action) -> Token {
                     }
                 }
             }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
+            }
         }
         Action::PlayDiscovery { card: id, onto_star } => {
-            t.fields[0] = ActionKind::PlayDiscovery as u16;
+            t.fields[0] = ActionKind::PlayDiscovery as u8;
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
             }
-            if let Some(sys) = find_system_containing(view, *onto_star) {
+            if let Some((sys, pos)) = find_system_containing_with_pos(view, *onto_star) {
                 t.fields[2] = star_name_to_idx(sys.star_name);
                 t.fields[3] = class_bucket(sys.class);
                 t.fields[4] = fill_bucket(sys.discoveries.len(), sys.class);
+                // Target-system position (2026-07-09, quantified via the
+                // AdvCPU-training-distribution scan): two different systems
+                // that happen to bucket identically (same star/class/fill)
+                // otherwise collide even with the card identity fixed.
+                t.fields[5] = clip_bucket(pos, FIELD_VOCAB - 1);
+            }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
             }
         }
-        Action::PlaySolarSystem { star, .. } => {
-            t.fields[0] = ActionKind::PlaySolarSystem as u16;
+        Action::PlaySolarSystem { star, discoveries } => {
+            t.fields[0] = ActionKind::PlaySolarSystem as u8;
             if let Some(card) = hand_card(view, *star) {
                 t.fields[1] = card_type_field(&card.kind);
                 if let CardKind::Star(name) = &card.kind {
                     t.fields[2] = star_name_to_idx(*name);
                     if let Some(class) = name.class() {
                         t.fields[3] = class_bucket(class);
-                        t.fields[4] = class_bucket(class); // simultaneous complete: fill == class
                     }
                 }
             }
+            // Attached-discoveries count (2026-07-09, quantified via the
+            // AdvCPU-training-distribution scan - this was THE dominant
+            // collision source, 77% of all remaining collisions after the
+            // card-identity fix): `discoveries: Vec<CardId>` was previously
+            // never read at all, so playing the same star with genuinely
+            // different discovery sets - a real difference in game outcome -
+            // collided into one token.
+            t.fields[5] = clip_bucket(discoveries.len(), FIELD_VOCAB - 1);
+            if let Some(slot) = hand_card_slot(view, *star) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
+            }
+            // Discovery-set signature (2026-07-10): count alone still
+            // collides whenever two same-size-but-different discovery
+            // combinations are simultaneously legal for the same star -
+            // confirmed the dominant residual (~439/568 collisions in the
+            // AdvCPU-distribution scan even after the count fix). Repurposes
+            // field[4] (previously a redundant duplicate of field[3] - "fill
+            // == class" for a simultaneous-complete play, no real signal) as
+            // an order-independent hash over the discoveries' card types.
+            // Lossy (a hash collision between two genuinely different
+            // combos remains theoretically possible) but drastically
+            // narrows the collision surface versus count alone - a stronger
+            // fix would need per-discovery identity fields, which the
+            // current 7-field budget has no room for without dropping
+            // something else already in use.
+            //
+            // 2026-07-10 correction: the original version summed
+            // `(type+1) * K` for a fixed constant K - since multiplying by
+            // a fixed odd constant mod 2^32 is a bijection, that carried
+            // exactly as much information as a plain `sum(type+1)`, no
+            // more. Two different combos with equal type-id sums (e.g.
+            // types {1,4} vs {2,3}) collided with certainty, not by chance
+            // - nowhere near as collision-resistant as a real hash. Fixed
+            // by mixing each element's bits (fmix32, Murmur3's finalizer)
+            // before summing, so equal-sum coincidences no longer
+            // guarantee a collision.
+            fn fmix32(mut h: u32) -> u32 {
+                h ^= h >> 16;
+                h = h.wrapping_mul(0x85ebca6b);
+                h ^= h >> 13;
+                h = h.wrapping_mul(0xc2b2ae35);
+                h ^= h >> 16;
+                h
+            }
+            let sig = discoveries.iter().filter_map(|id| hand_card(view, *id)).fold(0u32, |acc, c| {
+                acc.wrapping_add(fmix32(card_type_field(&c.kind) as u32 + 1))
+            });
+            t.fields[4] = clip_bucket((sig % (FIELD_VOCAB as u32 - 1)) as usize, FIELD_VOCAB - 1);
         }
         Action::PlayFlare(id) => {
-            t.fields[0] = ActionKind::PlayFlare as u16;
+            t.fields[0] = ActionKind::PlayFlare as u8;
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
             }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
+            }
         }
         Action::PlayFracture(id) => {
-            t.fields[0] = ActionKind::PlayFracture as u16;
+            t.fields[0] = ActionKind::PlayFracture as u8;
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
+            }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
             }
         }
         Action::PlayOmen { card: id, attachment } => {
             use novacana_engine::player::OmenAttachment;
             t.fields[0] = match attachment {
-                OmenAttachment::SolarEclipse { .. } => ActionKind::PlayOmenEclipse as u16,
-                OmenAttachment::PlanetOfLife { .. } => ActionKind::PlayOmenPlanetOfLife as u16,
+                OmenAttachment::SolarEclipse { .. } => ActionKind::PlayOmenEclipse as u8,
+                OmenAttachment::PlanetOfLife { .. } => ActionKind::PlayOmenPlanetOfLife as u8,
             };
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
@@ -435,26 +524,48 @@ fn encode_one_action(view: &GameView, action: &Action) -> Token {
                 OmenAttachment::SolarEclipse { system_star } => *system_star,
                 OmenAttachment::PlanetOfLife { rocky_planet_disc } => *rocky_planet_disc,
             };
-            if let Some(sys) = find_system_containing(view, target_card) {
+            if let Some((sys, pos)) = find_system_containing_with_pos(view, target_card) {
                 t.fields[2] = star_name_to_idx(sys.star_name);
                 t.fields[3] = class_bucket(sys.class);
                 t.fields[4] = fill_bucket(sys.discoveries.len(), sys.class);
+                // Target-system position - same fix as PlayDiscovery above.
+                t.fields[5] = clip_bucket(pos, FIELD_VOCAB - 1);
+            }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
             }
         }
-        Action::PlaySupernovas { fusion, .. } => {
-            t.fields[0] = ActionKind::PlaySupernovas as u16;
+        Action::PlaySupernovas { fusion, gravity, gas } => {
+            t.fields[0] = ActionKind::PlaySupernovas as u8;
             if let Some(card) = hand_card(view, *fusion) {
                 t.fields[1] = card_type_field(&card.kind);
+            }
+            if let Some(slot) = hand_card_slot(view, *fusion) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
+            }
+            // gravity/gas (2026-07-09): previously never read at all - each
+            // Supernova type is unique per ASTRA7.md's own docs (only one
+            // copy exists), so this likely never actually collided in
+            // practice (matches fidelity's 100% PlaySupernovas accuracy),
+            // but the encoding was still silently dropping real action data.
+            if let Some(slot) = hand_card_slot(view, *gravity) {
+                t.fields[2] = clip_bucket(slot, FIELD_VOCAB - 1);
+            }
+            if let Some(slot) = hand_card_slot(view, *gas) {
+                t.fields[3] = clip_bucket(slot, FIELD_VOCAB - 1);
             }
         }
         Action::PlayProtostar { card: id, choice } => {
             use novacana_engine::player::ProtostarChoice;
             t.fields[0] = match choice {
-                ProtostarChoice::DrawTwo => ActionKind::PlayProtostarDrawTwo as u16,
-                ProtostarChoice::SearchWhiteDwarf => ActionKind::PlayProtostarSearchWhiteDwarf as u16,
+                ProtostarChoice::DrawTwo => ActionKind::PlayProtostarDrawTwo as u8,
+                ProtostarChoice::SearchWhiteDwarf => ActionKind::PlayProtostarSearchWhiteDwarf as u8,
             };
             if let Some(card) = hand_card(view, *id) {
                 t.fields[1] = card_type_field(&card.kind);
+            }
+            if let Some(slot) = hand_card_slot(view, *id) {
+                t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
             }
         }
     }
@@ -467,13 +578,20 @@ fn encode_one_action(view: &GameView, action: &Action) -> Token {
 pub fn encode_action_tokens_chain(view: &GameView, legal: &[ChainAction]) -> Vec<Token> {
     let mut out = Vec::with_capacity(legal.len() + 1);
     let mut pass = Token::new(TokenType::Action);
-    pass.fields[0] = ActionKind::ChainResponsePass as u16;
+    pass.fields[0] = ActionKind::ChainResponsePass as u8;
     out.push(pass);
     for ca in legal {
         let mut t = Token::new(TokenType::Action);
-        t.fields[0] = ActionKind::ChainResponseCard as u16;
+        t.fields[0] = ActionKind::ChainResponseCard as u8;
         if let Some(card) = hand_card(view, ca.card) {
             t.fields[1] = card_type_field(&card.kind);
+        }
+        // Hand-slot index (2026-07-09, same fix as encode_one_action): same
+        // card-identity gap, just not hit in the live-play collision scan's
+        // sample - duplicate-type cards rarely co-occur as chain response
+        // options, but the same bug is there if they do.
+        if let Some(slot) = hand_card_slot(view, ca.card) {
+            t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
         }
         out.push(t);
     }
@@ -484,15 +602,15 @@ pub fn encode_action_tokens_chain(view: &GameView, legal: &[ChainAction]) -> Vec
 ///
 /// Fields 1-2 (slot index, option count) were added 2026-07-09 after the
 /// per-ActionKind fidelity diagnostic (ASTRA7.md §1.1/§10) found DecideOption
-/// at 60.0% accuracy on the single largest bucket (43% of all samples) —
+/// at 60.0% accuracy on the single largest bucket (43% of all samples) -
 /// far below every other kind. Root cause: without a positional field, two
 /// options in the same decide() call that don't trip any of
-/// `option_flags_bucket`'s 6 keyword checks produce BYTE-IDENTICAL tokens —
+/// `option_flags_bucket`'s 6 keyword checks produce BYTE-IDENTICAL tokens -
 /// an information bottleneck no amount of data or training can fix. v6 hit
 /// this exact problem and every one of its candidate encoders
 /// (candidate.rs's `set_pos`) always carried a slot/total pair for exactly
 /// this reason; this encoder was the one place that pattern didn't make it
-/// into v7. `view` remains otherwise unused here — decide() prompts don't
+/// into v7. `view` remains otherwise unused here - decide() prompts don't
 /// currently need board-state context beyond the prompt/option text.
 pub fn encode_action_tokens_decide(view: &GameView, req: &ChoiceRequest) -> Vec<Token> {
     let _ = view;
@@ -502,7 +620,7 @@ pub fn encode_action_tokens_decide(view: &GameView, req: &ChoiceRequest) -> Vec<
         .enumerate()
         .map(|(slot, opt)| {
             let mut t = Token::new(TokenType::Action);
-            t.fields[0] = ActionKind::DecideOption as u16;
+            t.fields[0] = ActionKind::DecideOption as u8;
             t.fields[1] = clip_bucket(slot, FIELD_VOCAB - 1);
             t.fields[2] = clip_bucket(total, FIELD_VOCAB - 1);
             t.fields[5] = prompt_type_bucket(&req.prompt);
@@ -514,7 +632,7 @@ pub fn encode_action_tokens_decide(view: &GameView, req: &ChoiceRequest) -> Vec<
 
 /// pick_targets: one token per `TargetOption`, in order. Multi-pick
 /// (count>1) decisions are trained greedy: only the first chosen target is
-/// used as the pointer-CE label (ASTRA7.md §3.2/§9 — "start greedy", the
+/// used as the pointer-CE label (ASTRA7.md §3.2/§9 - "start greedy", the
 /// same simplification v6's candidate head used for multi-select).
 pub fn encode_action_tokens_targets(view: &GameView, options: &[TargetOption]) -> Vec<Token> {
     options.iter().map(|opt| encode_one_target(view, &opt.target)).collect()
@@ -522,7 +640,7 @@ pub fn encode_action_tokens_targets(view: &GameView, options: &[TargetOption]) -
 
 fn encode_one_target(view: &GameView, target: &Target) -> Token {
     let mut t = Token::new(TokenType::Action);
-    t.fields[0] = ActionKind::PickTargetOption as u16;
+    t.fields[0] = ActionKind::PickTargetOption as u8;
     match target {
         Target::Player(idx) => {
             t.fields[5] = 0; // target_kind: player
@@ -546,7 +664,7 @@ fn encode_one_target(view: &GameView, target: &Target) -> Token {
                     // Card-within-system slot (found 2026-07-09 via the fidelity
                     // diagnostic + independent review): without this, every
                     // discovery in the same system (and the system's own star,
-                    // in chart_target_options) encodes to the identical token —
+                    // in chart_target_options) encodes to the identical token -
                     // same root cause as the DecideOption collision (§10.1).
                     // 0 = the star itself, 1+ = discovery position in list order.
                     t.fields[1] = if sys.star_id == *card_id {
@@ -591,14 +709,18 @@ fn encode_one_target(view: &GameView, target: &Target) -> Token {
 }
 
 /// choose_discards: one token per hand card, in order. Multi-discard is
-/// trained greedy (same simplification as pick_targets — see there).
+/// trained greedy (same simplification as pick_targets - see there).
 pub fn encode_action_tokens_discards(hand: &[Card]) -> Vec<Token> {
     hand.iter()
-        .map(|card| {
+        .enumerate()
+        .map(|(slot, card)| {
             let mut t = Token::new(TokenType::Action);
-            t.fields[0] = ActionKind::DiscardCandidate as u16;
+            t.fields[0] = ActionKind::DiscardCandidate as u8;
             t.fields[1] = card_type_field(&card.kind);
             t.fields[2] = card.star_class().map(class_bucket).unwrap_or(0);
+            // Hand-slot index (2026-07-09, same fix as encode_one_action):
+            // duplicate-type hand cards otherwise collide as discard options.
+            t.fields[6] = clip_bucket(slot, FIELD_VOCAB - 1);
             t
         })
         .collect()
@@ -607,7 +729,7 @@ pub fn encode_action_tokens_discards(hand: &[Card]) -> Vec<Token> {
 // ── Assembly ────────────────────────────────────────────────────────────
 
 /// A fully assembled, fixed-length token sequence for one decision, plus the
-/// number of real (non-pad) action tokens — i.e. the size of the legal set
+/// number of real (non-pad) action tokens - i.e. the size of the legal set
 /// the pointer head must classify over for this decision.
 pub struct EncodedDecision {
     pub tokens: TokenSeq,
@@ -616,7 +738,7 @@ pub struct EncodedDecision {
 
 /// Assemble state + history + action tokens into the fixed SEQ_LEN layout.
 /// Returns `None` if `action_tokens` doesn't fit in ACTION_MAX (should be
-/// exceedingly rare given the cap's headroom over v6's measured worst case —
+/// exceedingly rare given the cap's headroom over v6's measured worst case -
 /// callers should skip such a sample rather than corrupt the pointer target).
 pub fn assemble(view: &GameView, action_tokens: &[Token]) -> Option<EncodedDecision> {
     if action_tokens.is_empty() || action_tokens.len() > ACTION_MAX {
@@ -721,9 +843,9 @@ mod tests {
         assert_eq!(actions.len(), legal.len());
         for (tok, act) in actions.iter().zip(legal.iter()) {
             match act {
-                Action::Pass => assert_eq!(tok.fields[0], ActionKind::Pass as u16),
-                Action::PlayStar(_) => assert_eq!(tok.fields[0], ActionKind::PlayStar as u16),
-                Action::PlayFlare(_) => assert_eq!(tok.fields[0], ActionKind::PlayFlare as u16),
+                Action::Pass => assert_eq!(tok.fields[0], ActionKind::Pass as u8),
+                Action::PlayStar(_) => assert_eq!(tok.fields[0], ActionKind::PlayStar as u8),
+                Action::PlayFlare(_) => assert_eq!(tok.fields[0], ActionKind::PlayFlare as u8),
                 _ => unreachable!(),
             }
         }
@@ -741,7 +863,7 @@ mod tests {
         let legal: Vec<ChainAction> = Vec::new();
         let actions = encode_action_tokens_chain(&view, &legal);
         assert_eq!(actions.len(), 1); // just the pass token
-        assert_eq!(actions[0].fields[0], ActionKind::ChainResponsePass as u16);
+        assert_eq!(actions[0].fields[0], ActionKind::ChainResponsePass as u8);
     }
 
     #[test]

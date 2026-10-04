@@ -18,7 +18,7 @@ pub struct AttachedDiscovery {
 pub struct SolarSystem {
     pub star_id: CardId,
     pub star_name: StarName,
-    /// Discoveries needed to complete — equal to the star's class value.
+    /// Discoveries needed to complete - equal to the star's class value.
     pub class: u8,
     pub discoveries: Vec<AttachedDiscovery>,
     /// Solar Eclipse omen attached to this (completed) system.
@@ -81,7 +81,7 @@ impl fmt::Display for SolarSystem {
             format!("{}/{}", self.discoveries.len(), self.class)
         };
         let eclipse = if self.eclipse_id.is_some() { " [Eclipse]" } else { "" };
-        write!(f, "{} (Class {}){} — {}", self.star_name, self.class, eclipse, status)?;
+        write!(f, "{} (Class {}){} - {}", self.star_name, self.class, eclipse, status)?;
         for disc in &self.discoveries {
             let pol = if disc.planet_of_life_id.is_some() { " [Planet of Life]" } else { "" };
             write!(f, "\n    · {}{}", disc.name, pol)?;
@@ -127,6 +127,18 @@ impl StarChart {
         false
     }
 
+    pub fn complete_count(&self) -> usize {
+        self.systems.iter().filter(|s| s.is_complete()).count()
+    }
+
+    pub fn complete_iter(&self) -> impl Iterator<Item = &SolarSystem> {
+        self.systems.iter().filter(|s| s.is_complete())
+    }
+
+    pub fn incomplete_iter(&self) -> impl Iterator<Item = &SolarSystem> {
+        self.systems.iter().filter(|s| !s.is_complete())
+    }
+
     pub fn complete_systems(&self) -> Vec<&SolarSystem> {
         self.systems.iter().filter(|s| s.is_complete()).collect()
     }
@@ -141,7 +153,7 @@ impl StarChart {
     /// omens that survived (rules: "Omen cards remain in play"). Planet of Life omens
     /// are destroyed when their host Rocky Planet leaves, so they are included in `to_deck`.
     /// Drain the Star Chart for a board-wipe effect (Black Hole, Pulsar).
-    /// Eclipse-protected systems are completely untouched by any board wipe —
+    /// Eclipse-protected systems are completely untouched by any board wipe -
     /// the star, all discoveries, and the Solar Eclipse card all remain in place.
     /// Unprotected systems return their cards to the deck; Planet of Life is
     /// destroyed when its Rocky Planet host leaves.
@@ -173,12 +185,12 @@ impl StarChart {
     }
 
     /// Remove a single Discovery by card ID. Returns (star_name, disc_name,
-    /// freed_planet_of_life_id) if found — the third element is `Some` when
+    /// freed_planet_of_life_id) if found - the third element is `Some` when
     /// the removed Discovery was a Rocky Planet with a Planet of Life omen
     /// attached, so the caller can return that card to the deck instead of
     /// silently losing it (a real card-conservation bug this used to have:
     /// the omen id was dropped along with the rest of the `AttachedDiscovery`
-    /// struct — caught by the engine test suite's card-conservation invariant
+    /// struct - caught by the engine test suite's card-conservation invariant
     /// checker). Skips eclipse-protected systems unless `bypass_eclipse` is true.
     pub fn remove_discovery(
         &mut self,

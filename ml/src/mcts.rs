@@ -57,7 +57,7 @@ impl StateStack {
     }
 }
 
-// ── SimPlayerV6 — greedy policy, fresh stack per game ────────────────────────
+// ── SimPlayerV6 - greedy policy, fresh stack per game ────────────────────────
 
 struct SimPlayerV6 {
     net:   Arc<Net>,
@@ -131,7 +131,7 @@ impl Player for SimPlayerV6 {
     }
 }
 
-// ── ForcedThenSimV6 — plays forced abstract action first, then greedy ─────────
+// ── ForcedThenSimV6 - plays forced abstract action first, then greedy ─────────
 
 struct ForcedThenSimV6 {
     forced_abstract: usize,
@@ -174,7 +174,7 @@ impl Player for ForcedThenSimV6 {
 //
 // Scores a CONCRETE action by applying it to a cloned state (AdvCPU logic
 // resolves within-turn choices and opponent chain responses), then reading the
-// value head on the successor. No learned disambiguation involved — this
+// value head on the successor. No learned disambiguation involved - this
 // sidesteps the candidate head's label-noise ceiling entirely.
 
 // Structural equality for Action (the engine type doesn't derive PartialEq).
@@ -282,7 +282,7 @@ pub fn value_lookahead(state: &GameState, my_idx: usize, action: &Action, net: &
 //
 // Rollout leaves: up to SIM_TURNS turns of real play, then the value head.
 // A pure value-leaf variant (1 turn + value head) was tried 2026-07-08 and
-// CRASHED eval 38.7→28.2 in 5 iters while pl converged — the policy faithfully
+// CRASHED eval 38.7→28.2 in 5 iters while pl converged - the policy faithfully
 // learned targets that were worse than itself, because the value head can't
 // rank near states (same weakness the value-lookahead experiment measured).
 // Rollouts are the trustworthy part of the leaf signal; keep them.
@@ -315,7 +315,7 @@ fn simulate_from_v6(state: &GameState, my_idx: usize, forced_abstract: usize, ne
         return if result.winner_idx == my_idx { 1.0 } else { 0.0 };
     }
 
-    // Truncated — value head on the final state.
+    // Truncated - value head on the final state.
     let view = engine.build_view(my_idx);
     let snap = encode(&view);
     let mut stack = StateStack::new();
@@ -358,7 +358,7 @@ pub fn mcts_search_v6(
     // Root Dirichlet noise (training only, OPT-IN): lets the self-play search
     // explore beyond the policy's current preferences. WARNING: at our scale
     // (~5 legal actions, ≤200 sims, 200 games/iter) ε=0.25 poisoned the visit
-    // targets and crashed eval 38.7→27-28 twice (v6_az, v6b, 2026-07-08) —
+    // targets and crashed eval 38.7→27-28 twice (v6_az, v6b, 2026-07-08) -
     // AlphaZero's constants assume 35+ actions and millions of games. Only
     // enable together with much higher sim counts.
     if root_noise && legal_abs.len() >= 2 {
@@ -426,7 +426,7 @@ pub fn mcts_search_v6(
     (dist, best)
 }
 
-// ── MctsPlayer — eval player using v6 PUCT MCTS ──────────────────────────────
+// ── MctsPlayer - eval player using v6 PUCT MCTS ──────────────────────────────
 
 pub struct MctsPlayer {
     name_str:  String,

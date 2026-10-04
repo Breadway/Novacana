@@ -155,7 +155,7 @@ fn run_rulebook() -> io::Result<()> {
                 .map(|l| Line::from(Span::raw(l.clone())))
                 .collect();
             let para = Paragraph::new(visible)
-                .block(Block::default().borders(Borders::ALL).title(" Rulebook — ↑/↓ PgUp/PgDn · Q to return "))
+                .block(Block::default().borders(Borders::ALL).title(" Rulebook - ↑/↓ PgUp/PgDn · Q to return "))
                 .wrap(Wrap { trim: false });
             f.render_widget(para, area);
         })?;
@@ -215,7 +215,7 @@ fn run_card_ref() -> io::Result<()> {
 
             let visible: Vec<Line> = all_lines.iter().skip(scroll).take(visible_height).cloned().collect();
             let para = Paragraph::new(visible)
-                .block(Block::default().borders(Borders::ALL).title(" Card Reference — ↑/↓ PgUp/PgDn · Q to return "))
+                .block(Block::default().borders(Borders::ALL).title(" Card Reference - ↑/↓ PgUp/PgDn · Q to return "))
                 .wrap(Wrap { trim: false });
             f.render_widget(para, area);
         })?;

@@ -174,8 +174,8 @@ impl fmt::Display for GameView {
                 let status = if complete { "COMPLETE" } else {
                     &format!("needs {} more discovery/ies", sys.class as usize - sys.discoveries.len())
                 };
-                let eclipse = if sys.eclipse_id.is_some() { " [Solar Eclipse — PROTECTED]" } else { "" };
-                writeln!(f, "  • {} [class {}] {}/{} slots filled — {}{}",
+                let eclipse = if sys.eclipse_id.is_some() { " [Solar Eclipse - PROTECTED]" } else { "" };
+                writeln!(f, "  • {} [class {}] {}/{} slots filled - {}{}",
                     sys.star_name, sys.class, sys.discoveries.len(), sys.class, status, eclipse)?;
                 for disc in &sys.discoveries {
                     let pol = if disc.planet_of_life_id.is_some() { " [Planet of Life attached]" } else { "" };
@@ -207,7 +207,7 @@ impl fmt::Display for GameView {
                 for sys in &opp.star_chart.systems {
                     let complete = sys.discoveries.len() >= sys.class as usize;
                     let eclipse = if sys.eclipse_id.is_some() { " [PROTECTED]" } else { "" };
-                    writeln!(f, "  • {} [class {}] {}/{} — {}{}",
+                    writeln!(f, "  • {} [class {}] {}/{} - {}{}",
                         sys.star_name, sys.class, sys.discoveries.len(), sys.class,
                         if complete { "COMPLETE" } else { "incomplete" }, eclipse)?;
                 }
@@ -235,7 +235,7 @@ pub trait Player: Send + Sync {
     fn name(&self) -> &str;
 
     /// Choose an action during the Action Phase.
-    /// `legal_actions` is a pre-validated list — the player must return one of them.
+    /// `legal_actions` is a pre-validated list - the player must return one of them.
     fn choose_action(&self, view: &GameView, legal_actions: &[Action]) -> usize;
 
     /// Decide whether to add a link to the open Chain.

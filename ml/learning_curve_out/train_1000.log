@@ -1,0 +1,78 @@
+Generating imitation data: 1000 games × 4 players...
+  601693 samples in 0.3s  (policy=283739 cand=350891)
+Validation set: 500 games → 140536 policy samples
+Joint policy+value pretraining (30 epochs, lr=0.0003, label_smoothing=0.05)...
+  epoch 1/30: policy=0.3626 value=0.1915  val_acc=0.8991 val_ce=0.2797  *best
+  epoch 2/30: policy=0.2411 value=0.1853  val_acc=0.9125 val_ce=0.2339  *best
+  epoch 3/30: policy=0.2074 value=0.1813  val_acc=0.9234 val_ce=0.2167  *best
+  epoch 4/30: policy=0.1859 value=0.1755  val_acc=0.9243 val_ce=0.2187  *best
+  epoch 5/30: policy=0.1714 value=0.1664  val_acc=0.9272 val_ce=0.2019  *best
+  epoch 6/30: policy=0.1584 value=0.1550  val_acc=0.9274 val_ce=0.2047  *best
+  epoch 7/30: policy=0.1486 value=0.1418  val_acc=0.9328 val_ce=0.1898  *best
+  epoch 8/30: policy=0.1380 value=0.1282  val_acc=0.9319 val_ce=0.1864
+  epoch 9/30: policy=0.1298 value=0.1144  val_acc=0.9321 val_ce=0.1920
+  epoch 10/30: policy=0.1222 value=0.1020  val_acc=0.9347 val_ce=0.1828  *best
+  epoch 11/30: policy=0.1146 value=0.0900  val_acc=0.9325 val_ce=0.1852
+  epoch 12/30: policy=0.1078 value=0.0792  val_acc=0.9311 val_ce=0.1908
+  epoch 13/30: policy=0.1020 value=0.0701  val_acc=0.9326 val_ce=0.1896
+  epoch 14/30: policy=0.0961 value=0.0618  val_acc=0.9326 val_ce=0.1907
+  epoch 15/30: policy=0.0911 value=0.0551  val_acc=0.9320 val_ce=0.1999
+  epoch 16/30: policy=0.0869 value=0.0490  val_acc=0.9300 val_ce=0.1976
+  epoch 17/30: policy=0.0826 value=0.0443  val_acc=0.9307 val_ce=0.1976
+  epoch 18/30: policy=0.0787 value=0.0391  val_acc=0.9294 val_ce=0.2011
+  epoch 19/30: policy=0.0753 value=0.0356  val_acc=0.9293 val_ce=0.2027
+  epoch 20/30: policy=0.0725 value=0.0324  val_acc=0.9272 val_ce=0.2101
+  epoch 21/30: policy=0.0696 value=0.0294  val_acc=0.9278 val_ce=0.2081
+  epoch 22/30: policy=0.0673 value=0.0266  val_acc=0.9295 val_ce=0.2117
+  epoch 23/30: policy=0.0659 value=0.0249  val_acc=0.9283 val_ce=0.2131
+  epoch 24/30: policy=0.0638 value=0.0225  val_acc=0.9273 val_ce=0.2169
+  epoch 25/30: policy=0.0620 value=0.0218  val_acc=0.9284 val_ce=0.2165
+  epoch 26/30: policy=0.0602 value=0.0199  val_acc=0.9282 val_ce=0.2187
+  epoch 27/30: policy=0.0594 value=0.0187  val_acc=0.9276 val_ce=0.2151
+  epoch 28/30: policy=0.0584 value=0.0176  val_acc=0.9269 val_ce=0.2169
+  epoch 29/30: policy=0.0570 value=0.0168  val_acc=0.9253 val_ce=0.2225
+  epoch 30/30: policy=0.0560 value=0.0159  val_acc=0.9258 val_ce=0.2221
+Restoring best-policy checkpoint (val_acc=0.9347)
+Value fine-tune (10 epochs, lr=0.0001500000071246177)...
+  epoch 1/10: loss=0.1101
+  epoch 2/10: loss=0.1076
+  epoch 3/10: loss=0.1066
+  epoch 4/10: loss=0.1059
+  epoch 5/10: loss=0.1054
+  epoch 6/10: loss=0.1050
+  epoch 7/10: loss=0.1047
+  epoch 8/10: loss=0.1044
+  epoch 9/10: loss=0.1042
+  epoch 10/10: loss=0.1040
+Candidate pretraining (30 epochs)...
+  epoch 1/30: loss=0.8702
+  epoch 2/30: loss=0.7347
+  epoch 3/30: loss=0.6553
+  epoch 4/30: loss=0.5829
+  epoch 5/30: loss=0.5409
+  epoch 6/30: loss=0.5168
+  epoch 7/30: loss=0.4997
+  epoch 8/30: loss=0.4873
+  epoch 9/30: loss=0.4776
+  epoch 10/30: loss=0.4696
+  epoch 11/30: loss=0.4631
+  epoch 12/30: loss=0.4574
+  epoch 13/30: loss=0.4527
+  epoch 14/30: loss=0.4476
+  epoch 15/30: loss=0.4435
+  epoch 16/30: loss=0.4399
+  epoch 17/30: loss=0.4368
+  epoch 18/30: loss=0.4339
+  epoch 19/30: loss=0.4311
+  epoch 20/30: loss=0.4289
+  epoch 21/30: loss=0.4265
+  epoch 22/30: loss=0.4244
+  epoch 23/30: loss=0.4222
+  epoch 24/30: loss=0.4206
+  epoch 25/30: loss=0.4190
+  epoch 26/30: loss=0.4168
+  epoch 27/30: loss=0.4154
+  epoch 28/30: loss=0.4136
+  epoch 29/30: loss=0.4124
+  epoch 30/30: loss=0.4108
+Pretrain complete → learning_curve_out/pretrain_1000.bin

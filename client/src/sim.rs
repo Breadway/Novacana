@@ -200,9 +200,9 @@ fn print_report(records: &[GameRecord], num_players: usize, cpu: CpuKind) {
     println!("  Cosmic Cataclysm        : {:5}  ({:.1}%)", cataclysm, cataclysm as f64 / n as f64 * 100.0);
 
     if cataclysm as f64 / (n as f64) > 0.40 {
-        println!("  ⚠ Cosmic Cataclysm rate >40% — Supernova may be too accessible");
+        println!("  ⚠ Cosmic Cataclysm rate >40% - Supernova may be too accessible");
     } else if cataclysm as f64 / (n as f64) < 0.05 {
-        println!("  ⚠ Cosmic Cataclysm rate <5% — Supernova may be too rare");
+        println!("  ⚠ Cosmic Cataclysm rate <5% - Supernova may be too rare");
     }
 
     // ── Game length ───────────────────────────────────────────────────────────
@@ -273,10 +273,10 @@ fn print_report(records: &[GameRecord], num_players: usize, cpu: CpuKind) {
         println!("  OUTLIERS");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         if very_short > 0 {
-            println!("  ⚠ {} game(s) ended in <30 turns — possible runaway win or rules edge case", very_short);
+            println!("  ⚠ {} game(s) ended in <30 turns - possible runaway win or rules edge case", very_short);
         }
         if very_long > 0 {
-            println!("  ⚠ {} game(s) lasted >400 turns — possible deadlock or deck exhaustion issue", very_long);
+            println!("  ⚠ {} game(s) lasted >400 turns - possible deadlock or deck exhaustion issue", very_long);
         }
     }
 
@@ -306,7 +306,7 @@ fn print_report(records: &[GameRecord], num_players: usize, cpu: CpuKind) {
     }
     if timeouts > 0 {
         let pct = timeouts as f64 / n as f64 * 100.0;
-        issues.push(format!("{} game(s) ({:.1}%) hit the {}-turn limit — games may not be terminating naturally", timeouts, pct, MAX_TURNS));
+        issues.push(format!("{} game(s) ({:.1}%) hit the {}-turn limit - games may not be terminating naturally", timeouts, pct, MAX_TURNS));
     }
 
     if issues.is_empty() {

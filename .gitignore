@@ -8,3 +8,6 @@ src.zip
 *.bin.bak
 .idea/
 .claude/
+
+# Local hygiene notes (not for commit)
+CLAUDE.md

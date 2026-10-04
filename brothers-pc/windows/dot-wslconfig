@@ -1,0 +1,23 @@
+# Copy this file to C:\Users\<your-username>\.wslconfig (note the leading
+# dot - Windows Explorer may fight you on renaming to that; easiest is
+# `copy dot-wslconfig %USERPROFILE%\.wslconfig` from a cmd/PowerShell
+# prompt in this folder). Then `wsl --shutdown` to apply it.
+#
+# Why this exists: WSL2 defaults to using up to 50% of host RAM, which on
+# a 16GB machine (this PC) is only 8GB - too tight once you add Ubuntu's
+# own overhead, the training process's pregenerated-samples buffer
+# (chunk-games worth of self-play data held in RAM between generation and
+# training), and whatever the brother is running on the Windows side at
+# the same time. This raises the WSL2 ceiling to 12GB, leaving 4GB for
+# Windows + the brother's own use - tune down if 4GB isn't enough headroom
+# for him in practice, tune up if he's not using the machine much.
+#
+# processors=6: leaves 2 of the i7-10700K's 8 cores (16 threads total, so
+# really ~4 threads) for Windows itself - self-play generation is
+# CPU/rayon-bound and will happily eat every core WSL2 gives it otherwise.
+
+[wsl2]
+memory=12GB
+processors=6
+swap=4GB
+localhostForwarding=true

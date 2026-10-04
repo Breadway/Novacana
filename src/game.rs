@@ -17,7 +17,7 @@ use crate::star_chart::StarChart;
 pub enum GameEvent {
     /// A plain-text log line.
     Log(String),
-    /// A full state snapshot — sent after each meaningful action.
+    /// A full state snapshot - sent after each meaningful action.
     Snapshot(GameSnapshot),
     /// Fired before an LLM player starts thinking (for "… is thinking" indicator).
     Thinking { player_name: String },
@@ -52,7 +52,7 @@ pub struct PlayerState {
     pub name: String,
     pub hand: Vec<Card>,
     pub star_chart: StarChart,
-    /// Set by Black Hole — skip the next Action Phase (draw and discard still happen).
+    /// Set by Black Hole - skip the next Action Phase (draw and discard still happen).
     pub skip_next_action: bool,
     /// Turns remaining where this player's hand is revealed (Astral Projection).
     pub astral_projected_turns: u8,
@@ -275,7 +275,7 @@ impl GameEngine {
                 let path = format!("games/{}_autosave.log", start_ts);
                 if let Ok(mut f) = std::fs::File::create(&path) {
                     use std::io::Write;
-                    let _ = writeln!(f, "NOVACANA — autosave (in progress)");
+                    let _ = writeln!(f, "NOVACANA - autosave (in progress)");
                     let _ = writeln!(f, "Players: {}", player_names.join(", "));
                     let _ = writeln!(f, "{}", "─".repeat(60));
                     for line in &lines {
@@ -291,7 +291,7 @@ impl GameEngine {
         loop {
             let idx = self.state.active_player_idx;
             self.emit(format!(
-                "\n══ Turn {} — {} ══",
+                "\n══ Turn {} - {} ══",
                 self.state.turn_number,
                 self.state.players[idx].name
             ));
@@ -304,7 +304,7 @@ impl GameEngine {
             if hand_after_draw < 6 {
                 self.state.players[idx].skip_next_action = false;
                 self.emit(format!(
-                    "{} has only {} card(s) — action phase skipped.",
+                    "{} has only {} card(s) - action phase skipped.",
                     self.state.players[idx].name, hand_after_draw
                 ));
             } else if let Some(result) = self.run_action_phase(idx) {
@@ -371,7 +371,7 @@ impl GameEngine {
 
     fn handle_eclipse_maintenance(&mut self, player_idx: usize, star_id: CardId) {
         if self.state.players[player_idx].hand.is_empty() {
-            // Cannot pay — detach
+            // Cannot pay - detach
             if let Some(omen_id) =
                 self.state.players[player_idx].star_chart.detach_solar_eclipse(star_id)
             {
@@ -439,7 +439,7 @@ impl GameEngine {
                 self.state.players[idx].hand.push(card);
             }
             None => {
-                self.emit("Deck is empty — no card drawn.".into());
+                self.emit("Deck is empty - no card drawn.".into());
             }
         }
     }
@@ -616,7 +616,7 @@ impl GameEngine {
                 let gc = self.state.players[player_idx].take_from_hand(gravity)?;
                 let gac = self.state.players[player_idx].take_from_hand(gas)?;
                 self.emit(format!(
-                    "{} plays all three Supernovas — Cosmic Cataclysm attempt!",
+                    "{} plays all three Supernovas - Cosmic Cataclysm attempt!",
                     self.state.players[player_idx].name
                 ));
                 let mut chain = Chain::new(ChainLink::new(fc, player_idx, vec![]));
@@ -644,7 +644,7 @@ impl GameEngine {
                         if let Some(wd) = found {
                             let wd_id = wd.id;
                             self.emit(format!(
-                                "  {} finds White Dwarf — placed directly in Star Chart.",
+                                "  {} finds White Dwarf - placed directly in Star Chart.",
                                 self.state.players[player_idx].name
                             ));
                             self.state.players[player_idx]
@@ -652,7 +652,7 @@ impl GameEngine {
                                 .place_star(wd_id, StarName::WhiteDwarf, 3);
                             self.state.deck.shuffle();
                         } else {
-                            self.emit("  No White Dwarf in deck — drawing 2 instead.".into());
+                            self.emit("  No White Dwarf in deck - drawing 2 instead.".into());
                             self.state.deck.shuffle();
                             self.draw_n(player_idx, 2);
                         }
@@ -811,7 +811,7 @@ impl GameEngine {
         for raw_idx in chain.resolution_order() {
             if chain.links[raw_idx].negated {
                 self.emit(format!("  [negated] {}", chain.links[raw_idx].card));
-                // Negated omen — put on deck
+                // Negated omen - put on deck
                 let oid = chain.links[raw_idx].card.id;
                 if let Some(c) = self.state.reconstruct(oid) {
                     self.state.deck.push_bottom(c);
@@ -885,11 +885,11 @@ impl GameEngine {
                         self.state.players[player_idx].name, name
                     ));
                 } else {
-                    // No valid target — return to deck
+                    // No valid target - return to deck
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                    self.emit("Solar Eclipse: no valid target - returned to deck.".into());
                 }
             }
             OmenAttachment::PlanetOfLife { rocky_planet_disc } => {
@@ -905,7 +905,7 @@ impl GameEngine {
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Planet of Life: no valid target — returned to deck.".into());
+                    self.emit("Planet of Life: no valid target - returned to deck.".into());
                 }
             }
         }
@@ -926,7 +926,7 @@ impl GameEngine {
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                    self.emit("Solar Eclipse: no valid target - returned to deck.".into());
                     return;
                 }
                 let opts: Vec<String> = stars
@@ -980,7 +980,7 @@ impl GameEngine {
 
     fn flush_chain(&mut self, chain: Chain) {
         for link in chain.links {
-            // Attached omens are already tracked in star charts — only flush non-omen cards
+            // Attached omens are already tracked in star charts - only flush non-omen cards
             if !matches!(link.card.kind, CardKind::Omen(_)) {
                 self.state.deck.push_bottom(link.card);
             }
@@ -1001,7 +1001,7 @@ impl GameEngine {
     fn apply_flare(&mut self, flare: FlareName, actor: usize) -> Option<GameResult> {
         match flare {
             FlareName::StellarAlignment => {
-                self.emit(format!("{} Stellar Alignment — draw 2.", self.state.players[actor].name));
+                self.emit(format!("{} Stellar Alignment - draw 2.", self.state.players[actor].name));
                 self.draw_n(actor, 2);
                 self.state.stellar_alignment_this_turn = true;
                 None
@@ -1021,7 +1021,7 @@ impl GameEngine {
                 let mode = self.players[actor].decide(
                     &view,
                     &ChoiceRequest {
-                        prompt: "Wormhole — choose mode:".into(),
+                        prompt: "Wormhole - choose mode:".into(),
                         options: vec![
                             "Take 1 card blindly from an opponent's hand".into(),
                             "Take up to 2 Star/Discovery cards from an opponent's Star Chart".into(),
@@ -1058,7 +1058,7 @@ impl GameEngine {
                 let mode = self.players[actor].decide(
                     &view,
                     &ChoiceRequest {
-                        prompt: "Ignition — choose mode:".into(),
+                        prompt: "Ignition - choose mode:".into(),
                         options: vec![
                             "Destroy a Gas Giant in an opponent's Star Chart, then search for Yellow Dwarf".into(),
                             "Target opponent reveals hand; if they hold a Gas Giant, put it on bottom of deck, then search for Yellow Dwarf".into(),
@@ -1157,7 +1157,7 @@ impl GameEngine {
                 let target = opponents[choice.min(opponents.len() - 1)];
                 self.state.players[target].astral_projected_turns = 2;
                 self.emit(format!(
-                    "{} Astral Projection on {} — hand revealed for 2 of their turns.",
+                    "{} Astral Projection on {} - hand revealed for 2 of their turns.",
                     self.state.players[actor].name, self.state.players[target].name
                 ));
                 None
@@ -1176,7 +1176,7 @@ impl GameEngine {
         match frac {
             FractureName::BlackHole => {
                 self.emit(format!(
-                    "{} Black Hole — everyone shuffles hand and field into deck!",
+                    "{} Black Hole - everyone shuffles hand and field into deck!",
                     self.state.players[actor].name
                 ));
                 let n = self.state.players.len();
@@ -1209,7 +1209,7 @@ impl GameEngine {
                 let mode = self.players[actor].decide(
                     &view,
                     &ChoiceRequest {
-                        prompt: "Athena — choose mode:".into(),
+                        prompt: "Athena - choose mode:".into(),
                         options: vec![
                             "Destroy a Discovery in an opponent's Star Chart".into(),
                             "Return a Gas Giant from an opponent's Star Chart to their hand".into(),
@@ -1284,7 +1284,7 @@ impl GameEngine {
 
             FractureName::Pulsar => {
                 self.emit(format!(
-                    "{} Pulsar — shuffles own hand and field into deck, draws up to 7.",
+                    "{} Pulsar - shuffles own hand and field into deck, draws up to 7.",
                     self.state.players[actor].name
                 ));
                 let hand: Vec<Card> = self.state.players[actor].hand.drain(..).collect();
@@ -1320,7 +1320,7 @@ impl GameEngine {
                 self.drain_thinking(actor);
                 let restricted_class = (choice.min(4) as u8) + 2;
                 self.emit(format!(
-                    "{} Dark Matter Void — Class {} Stars locked for opponents until {}'s next turn.",
+                    "{} Dark Matter Void - Class {} Stars locked for opponents until {}'s next turn.",
                     self.state.players[actor].name,
                     restricted_class,
                     self.state.players[actor].name
@@ -1416,14 +1416,14 @@ impl GameEngine {
                         self.state.players[p2].hand.push(c1);
                     }
                 } else {
-                    self.emit("QEF: one or both players have no cards — no swap.".into());
+                    self.emit("QEF: one or both players have no cards - no swap.".into());
                 }
                 None
             }
 
             FractureName::StellarNurseryCollapse => {
                 self.emit(format!(
-                    "{} Stellar Nursery Collapse — shuffles deck, privately views top 5.",
+                    "{} Stellar Nursery Collapse - shuffles deck, privately views top 5.",
                     self.state.players[actor].name
                 ));
                 self.state.deck.shuffle();
@@ -1555,7 +1555,7 @@ impl GameEngine {
                                 .star_chart
                                 .attach_discovery(sid, card_id, dn);
                             self.emit(format!(
-                                "Wormhole: {} takes {} — attached to existing system.",
+                                "Wormhole: {} takes {} - attached to existing system.",
                                 self.state.players[actor].name, dn
                             ));
                         }
@@ -1563,7 +1563,7 @@ impl GameEngine {
                             if let Some(c) = self.state.reconstruct(card_id) {
                                 self.state.players[actor].hand.push(c);
                                 self.emit(format!(
-                                    "Wormhole: {} takes {} — added to hand.",
+                                    "Wormhole: {} takes {} - added to hand.",
                                     self.state.players[actor].name, dn
                                 ));
                             }
@@ -1844,7 +1844,7 @@ impl GameEngine {
         let mut file = fs::File::create(&path)?;
 
         // Header
-        writeln!(file, "NOVACANA — Game Log")?;
+        writeln!(file, "NOVACANA - Game Log")?;
         writeln!(file, "Winner : {} ({})", result.winner_name, cond)?;
         writeln!(file, "Turns  : {}", result.turns_elapsed)?;
         writeln!(file, "Players: {}", self.state.players.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))?;

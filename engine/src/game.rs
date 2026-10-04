@@ -11,6 +11,15 @@ use crate::player::{
 };
 use crate::star_chart::StarChart;
 
+// Keep formatting and string allocation out of silent search simulations.
+macro_rules! emit {
+    ($engine:ident, $message:expr) => {
+        if !$engine.silent || $engine.observer.is_some() {
+            $engine.emit($message);
+        }
+    };
+}
+
 // ── Observer events ───────────────────────────────────────────────────────────
 
 /// Events sent to the TUI observer thread after each significant state change.
@@ -18,7 +27,7 @@ use crate::star_chart::StarChart;
 pub enum GameEvent {
     /// A plain-text log line.
     Log(String),
-    /// A full state snapshot — sent after each meaningful action.
+    /// A full state snapshot - sent after each meaningful action.
     Snapshot(GameSnapshot),
     /// Fired before an LLM player starts thinking (for "… is thinking" indicator).
     Thinking { player_name: String },
@@ -56,7 +65,7 @@ pub struct PlayerState {
     pub name: String,
     pub hand: Vec<Card>,
     pub star_chart: StarChart,
-    /// Set by Black Hole — skip the next Action Phase (draw and discard still happen).
+    /// Set by Black Hole - skip the next Action Phase (draw and discard still happen).
     pub skip_next_action: bool,
     /// Turns remaining where this player's hand is revealed (Astral Projection).
     pub astral_projected_turns: u8,
@@ -117,7 +126,10 @@ pub struct GameResult {
 #[derive(Clone)]
 pub struct GameState {
     pub deck: Deck,
-    pub registry: HashMap<CardId, CardKind>,
+    /// Arc, mirroring `Deck::registry` (see its doc comment) - always the
+    /// same underlying map as `deck.registry`, just cloned out to its own
+    /// field for convenient access without going through `deck.`.
+    pub registry: Arc<HashMap<CardId, CardKind>>,
     pub players: Vec<PlayerState>,
     pub active_player_idx: usize,
     pub turn_number: u32,
@@ -133,7 +145,7 @@ pub struct GameState {
     /// Whether initial 5-card hands have been dealt yet. Explicit flag rather
     /// than inferring "fresh game" from `turn_number`/hand-emptiness: this is
     /// exactly the class of bug that corrupted simulations for weeks (see
-    /// `GameEngine::run`'s deal guard) — a boolean set once at deal time and
+    /// `GameEngine::run`'s deal guard) - a boolean set once at deal time and
     /// carried forward by `Clone` can't drift out of sync with turn-number
     /// bookkeeping the way a heuristic comparison can.
     hands_dealt: bool,
@@ -186,12 +198,12 @@ pub struct GameEngine {
     /// `max_turns` and `run_action_phase`'s 50-action-per-turn cap. Those two
     /// only bound cost inside `run()`'s own turn loop; `simulate_finish_chain`
     /// never enters that loop at all (see `cpu.rs`), so before this field it
-    /// had literally no cost cap — a chain-response search that kept finding
+    /// had literally no cost cap - a chain-response search that kept finding
     /// legal reactions could run indefinitely. `max_decisions` bounds the
     /// TOTAL number of real decision points (choose_action / respond_to_chain
     /// / decide / pick_targets / choose_discards) taken by this engine
     /// instance, regardless of which loop is responsible. None (unset) by
-    /// default, matching `max_turns`'s pattern — production/live games never
+    /// default, matching `max_turns`'s pattern - production/live games never
     /// opt in, only batch simulation code does.
     max_decisions: Option<usize>,
     decisions_taken: usize,
@@ -232,11 +244,11 @@ impl GameEngine {
     pub fn set_max_decisions(&mut self, n: usize) { self.max_decisions = Some(n); }
 
     /// Award the current leader (most complete systems, tiebreak: lowest
-    /// player index) — the truncation rule shared by `max_turns` and
+    /// player index) - the truncation rule shared by `max_turns` and
     /// `max_decisions` timeouts.
     fn award_leader(&self) -> GameResult {
         let (winner_idx, _) = self.state.players.iter().enumerate()
-            .max_by_key(|(_, p)| p.star_chart.complete_systems().len())
+            .max_by_key(|(_, p)| p.star_chart.complete_count())
             .unwrap();
         GameResult {
             winner_idx,
@@ -251,7 +263,7 @@ impl GameEngine {
         self.decisions_taken += 1;
     }
 
-    /// `Some(result)` iff `max_decisions` is set and has been exceeded —
+    /// `Some(result)` iff `max_decisions` is set and has been exceeded -
     /// callers treat this exactly like a `max_turns` timeout: stop
     /// immediately and award the current leader.
     fn decision_budget_exceeded(&self) -> Option<GameResult> {
@@ -323,14 +335,14 @@ impl GameEngine {
     fn drain_thinking(&mut self, player_idx: usize) {
         if let Some(thought) = self.players[player_idx].take_thinking() {
             let name = self.state.players[player_idx].name.clone();
-            self.emit(format!("[{} reasoning]", name));
+            emit!(self, format!("[{} reasoning]", name));
             for line in thought.lines() {
                 let t = line.trim();
                 if !t.is_empty() {
-                    self.emit(format!("  {}", t));
+                    emit!(self, format!("  {}", t));
                 }
             }
-            self.emit(format!("[/{} reasoning]", name));
+            emit!(self, format!("[/{} reasoning]", name));
         }
     }
 
@@ -397,28 +409,29 @@ impl GameEngine {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-        // Only deal for a fresh game — engines resumed via from_state (MCTS
+        // Only deal for a fresh game - engines resumed via from_state (MCTS
         // simulations, lookahead search, CPU 1-ply search) already have hands
         // (and `hands_dealt` carries forward through Clone), so dealing again
         // would silently hand every player 5 extra cards. Previously this
         // guard compared `turn_number == 0`, but `GameState::new` initializes
-        // `turn_number` to 1 (so "Turn 1" displays correctly) — that
+        // `turn_number` to 1 (so "Turn 1" displays correctly) - that
         // mismatch meant fresh games never dealt hands at all. Caught by
         // `tests::from_state_preserves_dealt_state` / `tests::fresh_game_deals_hands`.
         if !self.state.hands_dealt {
             self.deal_initial_hands();
         }
 
-        let stop_saver = Arc::new(AtomicBool::new(false));
-        let start_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let stop_saver = (!self.silent).then(|| Arc::new(AtomicBool::new(false)));
+        let start_ts = if self.silent { 0 } else {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        };
 
         // Auto-save the log every 10 seconds when not in silent/batch mode.
         if !self.silent {
             let log_arc = Arc::clone(&self.log);
             let player_names: Vec<String> = self.state.players.iter()
                 .map(|p| p.name.clone()).collect();
-            let stop_clone = Arc::clone(&stop_saver);
+            let stop_clone = Arc::clone(stop_saver.as_ref().unwrap());
 
             std::thread::spawn(move || {
                 let _ = std::fs::create_dir_all("games");
@@ -430,7 +443,7 @@ impl GameEngine {
                     let path = format!("games/{}_autosave.log", start_ts);
                     if let Ok(mut f) = std::fs::File::create(&path) {
                         use std::io::Write;
-                        let _ = writeln!(f, "NOVACANA — autosave (in progress)");
+                        let _ = writeln!(f, "NOVACANA - autosave (in progress)");
                         let _ = writeln!(f, "Players: {}", player_names.join(", "));
                         let _ = writeln!(f, "{}", "─".repeat(60));
                         for line in &lines {
@@ -446,8 +459,8 @@ impl GameEngine {
 
         loop {
             let idx = self.state.active_player_idx;
-            self.emit(format!(
-                "\n══ Turn {} — {} ══",
+            emit!(self, format!(
+                "\n══ Turn {} - {} ══",
                 self.state.turn_number,
                 self.state.players[idx].name
             ));
@@ -460,20 +473,24 @@ impl GameEngine {
             let limit = self.hand_limit();
             if hand_after_draw <= limit {
                 self.state.players[idx].skip_next_action = false;
-                self.emit(format!(
-                    "{} has only {} card(s) — action phase skipped.",
+                emit!(self, format!(
+                    "{} has only {} card(s) - action phase skipped.",
                     self.state.players[idx].name, hand_after_draw
                 ));
             } else if let Some(result) = self.run_action_phase(idx) {
                 self.send_game_over(&result);
-                stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                if let Some(stop_saver) = &stop_saver {
+                    stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                }
                 return result;
             }
             if let Some(result) = self.run_end_phase(idx) {
                 self.send_game_over(&result);
-                stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                if let Some(stop_saver) = &stop_saver {
+                    stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                }
                 return result;
             }
 
@@ -487,21 +504,25 @@ impl GameEngine {
                 if self.state.turn_number > max {
                     let result = self.award_leader();
                     self.send_game_over(&result);
-                    stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                    if let Some(stop_saver) = &stop_saver {
+                        stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                    }
                     return result;
                 }
             }
 
             // Decision-count watchdog: an additional safety net alongside
             // max_turns and the 50-action-per-turn cap (see the
-            // `max_decisions` field doc) — catches runaway cost that
+            // `max_decisions` field doc) - catches runaway cost that
             // accumulates WITHIN turns (nested decide()/pick_targets() calls
             // in card effects) rather than across them.
             if let Some(result) = self.decision_budget_exceeded() {
                 self.send_game_over(&result);
-                stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                if let Some(stop_saver) = &stop_saver {
+                    stop_saver.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = std::fs::remove_file(format!("games/{}_autosave.log", start_ts));
+                }
                 return result;
             }
         }
@@ -524,7 +545,7 @@ impl GameEngine {
         // Expire Dark Matter Void at caster's turn start
         if let Some(dmv) = &self.state.dark_matter_void {
             if dmv.caster_idx == idx {
-                self.emit("Dark Matter Void expires.".into());
+                emit!(self, "Dark Matter Void expires.".into());
                 self.state.dark_matter_void = None;
             }
         }
@@ -533,7 +554,7 @@ impl GameEngine {
         if self.state.players[idx].astral_projected_turns > 0 {
             self.state.players[idx].astral_projected_turns -= 1;
             if self.state.players[idx].astral_projected_turns == 0 {
-                self.emit(format!(
+                emit!(self, format!(
                     "{}'s hand is no longer revealed (Astral Projection expired).",
                     self.state.players[idx].name
                 ));
@@ -552,7 +573,7 @@ impl GameEngine {
 
     fn handle_eclipse_maintenance(&mut self, player_idx: usize, star_id: CardId) {
         if self.state.players[player_idx].hand.is_empty() {
-            // Cannot pay — detach
+            // Cannot pay - detach
             if let Some(omen_id) =
                 self.state.players[player_idx].star_chart.detach_solar_eclipse(star_id)
             {
@@ -564,7 +585,7 @@ impl GameEngine {
                     .system_for_star(star_id)
                     .map(|s| s.star_name.to_string())
                     .unwrap_or_default();
-                self.emit(format!("{}'s Solar Eclipse on {} detaches (no cards to pay).", self.state.players[player_idx].name, sys_name));
+                emit!(self, format!("{}'s Solar Eclipse on {} detaches (no cards to pay).", self.state.players[player_idx].name, sys_name));
             }
             return;
         }
@@ -592,7 +613,7 @@ impl GameEngine {
                 self.drain_thinking(player_idx);
             if let Some(&id) = discards.first() {
                 if let Some(card) = self.state.players[player_idx].take_from_hand(id) {
-                    self.emit(format!(
+                    emit!(self, format!(
                         "{} discards {} to maintain Solar Eclipse on {}.",
                         self.state.players[player_idx].name, card, sys_name
                     ));
@@ -606,7 +627,7 @@ impl GameEngine {
                 if let Some(c) = self.state.reconstruct(omen_id) {
                     self.state.deck.push_bottom(c);
                 }
-                self.emit(format!("{} lets Solar Eclipse on {} lapse.", self.state.players[player_idx].name, sys_name));
+                emit!(self, format!("{} lets Solar Eclipse on {} lapse.", self.state.players[player_idx].name, sys_name));
             }
         }
     }
@@ -614,14 +635,14 @@ impl GameEngine {
     fn run_draw_phase(&mut self, idx: usize) {
         match self.state.deck.draw() {
             Some(card) => {
-                self.emit(format!("{} draws a card.", self.state.players[idx].name));
+                emit!(self, format!("{} draws a card.", self.state.players[idx].name));
                 self.state.players[idx].hand.push(card);
             }
             None => {
-                self.emit("Deck is empty — no card drawn.".into());
+                emit!(self, "Deck is empty - no card drawn.".into());
                 if self.state.deck_exhausted_at_turn.is_none() {
                     self.state.deck_exhausted_at_turn = Some(self.state.turn_number);
-                    self.emit("Deck exhausted. Hand limits will shrink by 1 each round.".into());
+                    emit!(self, "Deck exhausted. Hand limits will shrink by 1 each round.".into());
                 }
             }
         }
@@ -630,7 +651,7 @@ impl GameEngine {
     fn run_action_phase(&mut self, idx: usize) -> Option<GameResult> {
         if self.state.players[idx].skip_next_action {
             self.state.players[idx].skip_next_action = false;
-            self.emit(format!(
+            emit!(self, format!(
                 "{} skips their Action Phase (Black Hole effect).",
                 self.state.players[idx].name
             ));
@@ -647,18 +668,18 @@ impl GameEngine {
             // once the discard reshuffles. No legitimate turn comes anywhere
             // near 50 actions; force the phase to end instead of looping.
             if actions_taken >= 50 {
-                self.emit(format!(
+                emit!(self, format!(
                     "{} action phase force-ended (50-action cap).",
                     self.state.players[idx].name
                 ));
                 break;
             }
-            // Decision-count watchdog checkpoint — see the `max_decisions`
+            // Decision-count watchdog checkpoint - see the `max_decisions`
             // field doc. Catches cost racked up by nested decide()/
             // pick_targets() calls inside prior actions' effects, not just
             // the action count itself.
             if let Some(result) = self.decision_budget_exceeded() {
-                self.emit(format!(
+                emit!(self, format!(
                     "{} action phase truncated (decision budget exceeded).",
                     self.state.players[idx].name
                 ));
@@ -674,7 +695,7 @@ impl GameEngine {
             let action = legal[choice.min(legal.len() - 1)].clone();
 
             if matches!(action, Action::Pass) {
-                self.emit(format!("{} passes.", self.state.players[idx].name));
+                emit!(self, format!("{} passes.", self.state.players[idx].name));
                 self.send_snapshot(None);
                 break;
             }
@@ -694,7 +715,7 @@ impl GameEngine {
         let excess = self.state.players[idx].hand.len().saturating_sub(limit);
         if excess > 0 {
             if limit < 5 {
-                self.emit(format!(
+                emit!(self, format!(
                     "Hand limit is now {} (deck exhaustion pressure).",
                     limit
                 ));
@@ -704,7 +725,7 @@ impl GameEngine {
             self.drain_thinking(idx);
             for id in to_discard {
                 if let Some(card) = self.state.players[idx].take_from_hand(id) {
-                    self.emit(format!("{} discards {}.", self.state.players[idx].name, card));
+                    emit!(self, format!("{} discards {}.", self.state.players[idx].name, card));
                     self.state.deck.push_bottom(card);
                 }
             }
@@ -716,7 +737,7 @@ impl GameEngine {
         }
 
         // Astronomical Domination victory check
-        let complete = self.state.players[idx].star_chart.complete_systems().len();
+        let complete = self.state.players[idx].star_chart.complete_count();
         if complete >= 3 {
             return Some(GameResult {
                 winner_idx: idx,
@@ -742,7 +763,7 @@ impl GameEngine {
                     CardKind::Star(n) => (*n, n.class()?),
                     _ => return None,
                 };
-                self.emit(format!(
+                emit!(self, format!(
                     "{} places {} (Class {}) in Star Chart.",
                     self.state.players[player_idx].name, name, class
                 ));
@@ -764,7 +785,7 @@ impl GameEngine {
                 self.state.players[player_idx]
                     .star_chart
                     .attach_discovery(onto_star, card_id, disc_name);
-                self.emit(format!(
+                emit!(self, format!(
                     "{} attaches {} to {}.",
                     self.state.players[player_idx].name, disc_name, star_name
                 ));
@@ -791,7 +812,7 @@ impl GameEngine {
                         }
                     }
                 }
-                self.emit(format!(
+                emit!(self, format!(
                     "{} completes a Solar System: {} with [{}].",
                     self.state.players[player_idx].name,
                     star_name,
@@ -803,7 +824,7 @@ impl GameEngine {
             Action::PlayOmen { card: card_id, attachment } => {
                 let card = self.state.players[player_idx].take_from_hand(card_id)?;
                 self.state.record_play(player_idx, card.kind.clone());
-                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                emit!(self, format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
                 let link = ChainLink::new(card, player_idx, vec![]);
                 let mut chain = Chain::new(link);
                 if let Some(result) = self.run_chain_responses(&mut chain, player_idx) {
@@ -817,7 +838,7 @@ impl GameEngine {
             Action::PlayFlare(card_id) => {
                 let card = self.state.players[player_idx].take_from_hand(card_id)?;
                 self.state.record_play(player_idx, card.kind.clone());
-                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                emit!(self, format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
                 let link = ChainLink::new(card, player_idx, vec![]);
                 let mut chain = Chain::new(link);
                 if let Some(result) = self.run_chain_responses(&mut chain, player_idx) {
@@ -830,7 +851,7 @@ impl GameEngine {
             Action::PlayFracture(card_id) => {
                 let card = self.state.players[player_idx].take_from_hand(card_id)?;
                 self.state.record_play(player_idx, card.kind.clone());
-                self.emit(format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
+                emit!(self, format!("{} plays {} into Chain.", self.state.players[player_idx].name, card));
                 let link = ChainLink::new(card, player_idx, vec![]);
                 let mut chain = Chain::new(link);
                 if let Some(result) = self.run_chain_responses(&mut chain, player_idx) {
@@ -847,8 +868,8 @@ impl GameEngine {
                 self.state.record_play(player_idx, gc.kind.clone());
                 let gac = self.state.players[player_idx].take_from_hand(gas)?;
                 self.state.record_play(player_idx, gac.kind.clone());
-                self.emit(format!(
-                    "{} plays all three Supernovas — Cosmic Cataclysm attempt!",
+                emit!(self, format!(
+                    "{} plays all three Supernovas - Cosmic Cataclysm attempt!",
                     self.state.players[player_idx].name
                 ));
                 let mut chain = Chain::new(ChainLink::new(fc, player_idx, vec![]));
@@ -865,10 +886,10 @@ impl GameEngine {
             Action::PlayProtostar { card: card_id, choice } => {
                 let card = self.state.players[player_idx].take_from_hand(card_id)?;
                 self.state.record_play(player_idx, card.kind.clone());
-                self.emit(format!("{} plays Protostar.", self.state.players[player_idx].name));
+                emit!(self, format!("{} plays Protostar.", self.state.players[player_idx].name));
                 // Protostar shuffles itself back into deck first
                 self.state.deck.shuffle_in(card);
-                self.emit("  Protostar shuffled into deck.".into());
+                emit!(self, "  Protostar shuffled into deck.".into());
                 match choice {
                     ProtostarChoice::DrawTwo => {
                         self.draw_n(player_idx, 2);
@@ -879,8 +900,8 @@ impl GameEngine {
                         });
                         if let Some(wd) = found {
                             let wd_id = wd.id;
-                            self.emit(format!(
-                                "  {} finds White Dwarf — placed directly in Star Chart.",
+                            emit!(self, format!(
+                                "  {} finds White Dwarf - placed directly in Star Chart.",
                                 self.state.players[player_idx].name
                             ));
                             self.state.players[player_idx]
@@ -888,7 +909,7 @@ impl GameEngine {
                                 .place_star(wd_id, StarName::WhiteDwarf, 3);
                             self.state.deck.shuffle();
                         } else {
-                            self.emit("  No White Dwarf in deck — drawing 2 instead.".into());
+                            emit!(self, "  No White Dwarf in deck - drawing 2 instead.".into());
                             self.state.deck.shuffle();
                             self.draw_n(player_idx, 2);
                         }
@@ -914,7 +935,7 @@ impl GameEngine {
     }
 
     /// Core chain-response collection loop, resumable from an explicit
-    /// `(start, consecutive_passes)` cursor — see `ChainResumeCursor`.
+    /// `(start, consecutive_passes)` cursor - see `ChainResumeCursor`.
     /// After each addition, each of the other (n-1) players gets one chance to respond in
     /// clockwise order starting from the player left of the adder. If all pass (or have no
     /// legal responses), the chain closes. The adder is not offered their own addition.
@@ -929,14 +950,14 @@ impl GameEngine {
         let mut consecutive_passes = consecutive_passes;
 
         while consecutive_passes < n - 1 {
-            // Decision-count watchdog checkpoint — see the `max_decisions`
+            // Decision-count watchdog checkpoint - see the `max_decisions`
             // field doc. This loop has no other bound: in principle every
             // player could keep having a legal reactive card to play,
             // extending the window indefinitely (bounded in practice only by
             // finite hand sizes, which is exactly the kind of implicit bound
             // this watchdog exists to not have to rely on).
             if let Some(result) = self.decision_budget_exceeded() {
-                self.emit("Chain response collection truncated (decision budget exceeded).".into());
+                emit!(self, "Chain response collection truncated (decision budget exceeded).".into());
                 return Some(result);
             }
 
@@ -961,11 +982,11 @@ impl GameEngine {
                 Some(choice) => {
                     let chosen = &legal[choice.min(legal.len() - 1)];
                     if let Some(card) = self.state.players[responder].take_from_hand(chosen.card) {
-                        self.emit(format!(
+                        emit!(self, format!(
                             "  {} responds: {}",
                             self.state.players[responder].name, card
                         ));
-                        // Chain responses were never in play_history before —
+                        // Chain responses were never in play_history before -
                         // a real gap given how much reactive-card timing
                         // turned out to matter (see ASTRA7.md §1.1).
                         self.state.record_play(responder, card.kind.clone());
@@ -986,22 +1007,22 @@ impl GameEngine {
     /// Simulation-only entry point: continue chain-response resolution on a
     /// CLONED engine from the TRUE resume cursor the live game had reached
     /// (see `ChainResumeCursor`), then resolve the chain. Never called from
-    /// `run()` — used exclusively by search-based CPU players (see
+    /// `run()` - used exclusively by search-based CPU players (see
     /// `engine/src/cpu.rs`) to score candidate chain responses by their
     /// actual resolved effect instead of a static heuristic.
     ///
     /// Resumes with the EXACT continuation semantics the real game would
-    /// use — no approximation: `cursor` carries the same `(start,
+    /// use - no approximation: `cursor` carries the same `(start,
     /// consecutive_passes)` position `run_chain_responses_from` had reached
     /// live, so players who already passed in this window before the
     /// caller's turn are correctly not re-asked. (Previously this
     /// reconstructed the window from scratch assuming nobody had responded
     /// yet, which could ask 0-2 extra players a "will you respond" question
-    /// the true continuation wouldn't have reached — see git history for the
+    /// the true continuation wouldn't have reached - see git history for the
     /// old approximation if useful context.) Only ever runs on an
-    /// already-cloned GameEngine (see `simulate_chain_response` in cpu.rs) —
+    /// already-cloned GameEngine (see `simulate_chain_response` in cpu.rs) -
     /// never mutates a live game. Bounded by `max_decisions` like any other
-    /// engine path — callers should set it, since this path never enters
+    /// engine path - callers should set it, since this path never enters
     /// `run()`'s main loop and so gets none of `max_turns`'/the 50-action
     /// cap's protection otherwise.
     pub fn simulate_finish_chain(&mut self, mut chain: Chain, cursor: ChainResumeCursor) -> Option<GameResult> {
@@ -1014,17 +1035,17 @@ impl GameEngine {
 
     /// Resolve a closed chain in LIFO order.
     fn resolve_chain(&mut self, mut chain: Chain) -> Option<GameResult> {
-        self.emit("Chain resolves (LIFO):".into());
+        emit!(self, "Chain resolves (LIFO):".into());
 
         for raw_idx in chain.resolution_order() {
             if chain.links[raw_idx].negated {
-                self.emit(format!("  [negated] {}", chain.links[raw_idx].card));
+                emit!(self, format!("  [negated] {}", chain.links[raw_idx].card));
                 continue;
             }
 
             let card = chain.links[raw_idx].card.clone();
             let actor = chain.links[raw_idx].player_idx;
-            self.emit(format!("  Resolving {}", card));
+            emit!(self, format!("  Resolving {}", card));
 
             // Cosmic Denial handled here to allow mutating chain
             if matches!(&card.kind, CardKind::Flare(FlareName::CosmicDenial)) {
@@ -1035,7 +1056,7 @@ impl GameEngine {
                     .filter(|&i| i < raw_idx)
                     .collect();
                 if deniable.is_empty() {
-                    self.emit("  Cosmic Denial: no valid targets.".into());
+                    emit!(self, "  Cosmic Denial: no valid targets.".into());
                 } else {
                     let opts: Vec<String> = deniable
                         .iter()
@@ -1051,7 +1072,7 @@ impl GameEngine {
                     let target = deniable[choice.min(deniable.len() - 1)];
                     chain.negate(target);
                     let negated_card_name = chain.links[target].card.to_string();
-                    self.emit(format!(
+                    emit!(self, format!(
                         "  Cosmic Denial negates CL{}: {}",
                         target + 1,
                         negated_card_name
@@ -1086,7 +1107,7 @@ impl GameEngine {
                 .map(|l| l.player_idx)
                 .unwrap_or(self.state.active_player_idx);
             self.flush_chain(chain);
-            self.emit(format!(
+            emit!(self, format!(
                 "{} wins via Cosmic Cataclysm!",
                 self.state.players[winner_idx].name
             ));
@@ -1109,12 +1130,12 @@ impl GameEngine {
         caster_idx: usize,
         attachment: &OmenAttachment,
     ) -> Option<GameResult> {
-        self.emit("Chain resolves (LIFO):".into());
+        emit!(self, "Chain resolves (LIFO):".into());
 
         for raw_idx in chain.resolution_order() {
             if chain.links[raw_idx].negated {
-                self.emit(format!("  [negated] {}", chain.links[raw_idx].card));
-                // Negated omen — put on deck
+                emit!(self, format!("  [negated] {}", chain.links[raw_idx].card));
+                // Negated omen - put on deck
                 let oid = chain.links[raw_idx].card.id;
                 if let Some(c) = self.state.reconstruct(oid) {
                     self.state.deck.push_bottom(c);
@@ -1126,7 +1147,7 @@ impl GameEngine {
             let actor = chain.links[raw_idx].player_idx;
 
             if actor == caster_idx && matches!(card.kind, CardKind::Omen(_)) {
-                self.emit(format!("  {} attaches.", card));
+                emit!(self, format!("  {} attaches.", card));
                 self.apply_omen_attachment(card.id, actor, attachment);
                 continue;
             }
@@ -1182,16 +1203,16 @@ impl GameEngine {
                         .system_for_star(*system_star)
                         .map(|s| s.star_name.to_string())
                         .unwrap_or_default();
-                    self.emit(format!(
+                    emit!(self, format!(
                         "{}'s Solar Eclipse protects {}.",
                         self.state.players[player_idx].name, name
                     ));
                 } else {
-                    // No valid target — return to deck
+                    // No valid target - return to deck
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                    emit!(self, "Solar Eclipse: no valid target - returned to deck.".into());
                 }
             }
             OmenAttachment::PlanetOfLife { rocky_planet_disc } => {
@@ -1199,7 +1220,7 @@ impl GameEngine {
                     .star_chart
                     .attach_planet_of_life(*rocky_planet_disc, omen_id)
                 {
-                    self.emit(format!(
+                    emit!(self, format!(
                         "{} attaches Planet of Life to a Rocky Planet.",
                         self.state.players[player_idx].name
                     ));
@@ -1207,7 +1228,7 @@ impl GameEngine {
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Planet of Life: no valid target — returned to deck.".into());
+                    emit!(self, "Planet of Life: no valid target - returned to deck.".into());
                 }
             }
         }
@@ -1228,7 +1249,7 @@ impl GameEngine {
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Solar Eclipse: no valid target — returned to deck.".into());
+                    emit!(self, "Solar Eclipse: no valid target - returned to deck.".into());
                     return;
                 }
                 let opts: Vec<String> = stars
@@ -1260,7 +1281,7 @@ impl GameEngine {
                     if let Some(c) = self.state.reconstruct(omen_id) {
                         self.state.deck.push_bottom(c);
                     }
-                    self.emit("Planet of Life: no Rocky Planet to attach to.".into());
+                    emit!(self, "Planet of Life: no Rocky Planet to attach to.".into());
                     return;
                 }
                 let req = ChoiceRequest {
@@ -1280,7 +1301,7 @@ impl GameEngine {
 
     fn flush_chain(&mut self, chain: Chain) {
         for link in chain.links {
-            // Attached omens are already tracked in star charts — only flush non-omen cards
+            // Attached omens are already tracked in star charts - only flush non-omen cards
             if !matches!(link.card.kind, CardKind::Omen(_)) {
                 self.state.deck.push_bottom(link.card);
             }
@@ -1301,7 +1322,7 @@ impl GameEngine {
     fn apply_flare(&mut self, flare: FlareName, actor: usize) -> Option<GameResult> {
         match flare {
             FlareName::StellarAlignment => {
-                self.emit(format!("{} Stellar Alignment — draw 2.", self.state.players[actor].name));
+                emit!(self, format!("{} Stellar Alignment - draw 2.", self.state.players[actor].name));
                 self.draw_n(actor, 2);
                 self.state.stellar_alignment_this_turn = true;
                 None
@@ -1320,7 +1341,7 @@ impl GameEngine {
                 let mode = self.ask_decide(
                     actor,
                     &ChoiceRequest {
-                        prompt: "Wormhole — choose mode:".into(),
+                        prompt: "Wormhole - choose mode:".into(),
                         options: vec![
                             "Take 1 card blindly from an opponent's hand".into(),
                             "Take up to 2 Star/Discovery cards from an opponent's Star Chart".into(),
@@ -1355,7 +1376,7 @@ impl GameEngine {
                 let mode = self.ask_decide(
                     actor,
                     &ChoiceRequest {
-                        prompt: "Ignition — choose mode:".into(),
+                        prompt: "Ignition - choose mode:".into(),
                         options: vec![
                             "Destroy a Gas Giant in an opponent's Star Chart, then search for Yellow Dwarf".into(),
                             "Target opponent reveals hand; if they hold a Gas Giant, put it on bottom of deck, then search for Yellow Dwarf".into(),
@@ -1384,17 +1405,17 @@ impl GameEngine {
                         self.state.players[target].star_chart.take_gas_giant(false)
                     {
                         if let Some(c) = self.state.reconstruct(gid) {
-                            self.emit(format!(
+                            emit!(self, format!(
                                 "Ignition destroys Gas Giant from {}'s {} system.",
                                 self.state.players[target].name, star_name
                             ));
                             self.state.deck.push_bottom(c);
                         }
                     } else {
-                        self.emit("Ignition: no Gas Giant in target's Star Chart.".into());
+                        emit!(self, "Ignition: no Gas Giant in target's Star Chart.".into());
                     }
                 } else {
-                    self.emit(format!(
+                    emit!(self, format!(
                         "Ignition: {} reveals hand.",
                         self.state.players[target].name
                     ));
@@ -1405,14 +1426,14 @@ impl GameEngine {
                         .map(|c| c.id);
                     if let Some(gid) = gas_id {
                         if let Some(card) = self.state.players[target].take_from_hand(gid) {
-                            self.emit(format!(
+                            emit!(self, format!(
                                 "Ignition puts Gas Giant from {}'s hand on bottom of deck.",
                                 self.state.players[target].name
                             ));
                             self.state.deck.push_bottom(card);
                         }
                     } else {
-                        self.emit("Ignition: no Gas Giant in target's hand.".into());
+                        emit!(self, "Ignition: no Gas Giant in target's hand.".into());
                     }
                 }
 
@@ -1422,14 +1443,14 @@ impl GameEngine {
                 });
                 match yd {
                     Some(card) => {
-                        self.emit(format!(
+                        emit!(self, format!(
                             "{} finds Yellow Dwarf via Ignition.",
                             self.state.players[actor].name
                         ));
                         self.state.players[actor].hand.push(card);
                     }
                     None => {
-                        self.emit("No Yellow Dwarf in deck.".into());
+                        emit!(self, "No Yellow Dwarf in deck.".into());
                     }
                 }
                 self.state.deck.shuffle();
@@ -1451,8 +1472,8 @@ impl GameEngine {
                 self.drain_thinking(actor);
                 let target = opponents[choice.min(opponents.len() - 1)];
                 self.state.players[target].astral_projected_turns = 2;
-                self.emit(format!(
-                    "{} Astral Projection on {} — hand revealed for 2 of their turns.",
+                emit!(self, format!(
+                    "{} Astral Projection on {} - hand revealed for 2 of their turns.",
                     self.state.players[actor].name, self.state.players[target].name
                 ));
                 None
@@ -1470,8 +1491,8 @@ impl GameEngine {
     fn apply_fracture(&mut self, frac: FractureName, actor: usize) -> Option<GameResult> {
         match frac {
             FractureName::BlackHole => {
-                self.emit(format!(
-                    "{} Black Hole — everyone shuffles hand and field into deck!",
+                emit!(self, format!(
+                    "{} Black Hole - everyone shuffles hand and field into deck!",
                     self.state.players[actor].name
                 ));
                 let n = self.state.players.len();
@@ -1503,7 +1524,7 @@ impl GameEngine {
                 let mode = self.ask_decide(
                     actor,
                     &ChoiceRequest {
-                        prompt: "Athena — choose mode:".into(),
+                        prompt: "Athena - choose mode:".into(),
                         options: vec![
                             "Destroy a Discovery in an opponent's Star Chart".into(),
                             "Return a Gas Giant from an opponent's Star Chart to their hand".into(),
@@ -1526,7 +1547,7 @@ impl GameEngine {
                 if mode == 0 {
                     let opts = self.disc_target_options(target);
                     if opts.is_empty() {
-                        self.emit(format!(
+                        emit!(self, format!(
                             "Athena: {} has no valid Discovery targets.",
                             self.state.players[target].name
                         ));
@@ -1542,14 +1563,14 @@ impl GameEngine {
                                 .remove_discovery(card_id, false)
                             {
                                 if let Some(c) = self.state.reconstruct(card_id) {
-                                    self.emit(format!(
+                                    emit!(self, format!(
                                         "Athena destroys {} from {}'s Star Chart.",
                                         dn, self.state.players[target].name
                                     ));
                                     self.state.deck.push_bottom(c);
                                 }
                                 // The destroyed Discovery may have had a Planet
-                                // of Life omen attached — it must return to the
+                                // of Life omen attached - it must return to the
                                 // deck too, or it's lost from the game entirely.
                                 if let Some(pol_id) = freed_pol_id {
                                     if let Some(c) = self.state.reconstruct(pol_id) {
@@ -1564,22 +1585,22 @@ impl GameEngine {
                         self.state.players[target].star_chart.take_gas_giant(false)
                     {
                         if let Some(c) = self.state.reconstruct(gid) {
-                            self.emit(format!(
+                            emit!(self, format!(
                                 "Athena returns Gas Giant from {}'s {} system to their hand.",
                                 self.state.players[target].name, sn
                             ));
                             self.state.players[target].hand.push(c);
                         }
                     } else {
-                        self.emit("Athena: no Gas Giant in target's Star Chart.".into());
+                        emit!(self, "Athena: no Gas Giant in target's Star Chart.".into());
                     }
                 }
                 None
             }
 
             FractureName::Pulsar => {
-                self.emit(format!(
-                    "{} Pulsar — shuffles own hand and field into deck, draws up to 7.",
+                emit!(self, format!(
+                    "{} Pulsar - shuffles own hand and field into deck, draws up to 7.",
                     self.state.players[actor].name
                 ));
                 let hand: Vec<Card> = self.state.players[actor].hand.drain(..).collect();
@@ -1613,8 +1634,8 @@ impl GameEngine {
                 );
                 self.drain_thinking(actor);
                 let restricted_class = (choice.min(4) as u8) + 2;
-                self.emit(format!(
-                    "{} Dark Matter Void — Class {} Stars locked for opponents until {}'s next turn.",
+                emit!(self, format!(
+                    "{} Dark Matter Void - Class {} Stars locked for opponents until {}'s next turn.",
                     self.state.players[actor].name,
                     restricted_class,
                     self.state.players[actor].name
@@ -1698,7 +1719,7 @@ impl GameEngine {
                     let c1 = self.state.players[p1].take_from_hand(id1);
                     let c2 = self.state.players[p2].take_from_hand(id2);
                     if let (Some(c1), Some(c2)) = (c1, c2) {
-                        self.emit(format!(
+                        emit!(self, format!(
                             "QEF: {} and {} swap cards.",
                             self.state.players[p1].name, self.state.players[p2].name
                         ));
@@ -1706,14 +1727,14 @@ impl GameEngine {
                         self.state.players[p2].hand.push(c1);
                     }
                 } else {
-                    self.emit("QEF: one or both players have no cards — no swap.".into());
+                    emit!(self, "QEF: one or both players have no cards - no swap.".into());
                 }
                 None
             }
 
             FractureName::StellarNurseryCollapse => {
-                self.emit(format!(
-                    "{} Stellar Nursery Collapse — shuffles deck, privately views top 5.",
+                emit!(self, format!(
+                    "{} Stellar Nursery Collapse - shuffles deck, privately views top 5.",
                     self.state.players[actor].name
                 ));
                 self.state.deck.shuffle();
@@ -1771,14 +1792,14 @@ impl GameEngine {
                 });
                 match found {
                     Some(card) => {
-                        self.emit(format!(
+                        emit!(self, format!(
                             "{} Shockwave finds {}.",
                             self.state.players[actor].name, card
                         ));
                         self.state.players[actor].hand.push(card);
                     }
                     None => {
-                        self.emit("Shockwave: Supernova not found in deck.".into());
+                        emit!(self, "Shockwave: Supernova not found in deck.".into());
                     }
                 }
                 self.state.deck.shuffle();
@@ -1791,12 +1812,12 @@ impl GameEngine {
 
     fn wormhole_blind_steal(&mut self, actor: usize, target: usize) {
         if self.state.players[target].hand.is_empty() {
-            self.emit(format!("Wormhole: {} has no cards.", self.state.players[target].name));
+            emit!(self, format!("Wormhole: {} has no cards.", self.state.players[target].name));
             return;
         }
-        let pos = (rand::random::<usize>()) % self.state.players[target].hand.len();
+        let pos = (crate::random::random::<usize>()) % self.state.players[target].hand.len();
         let stolen = self.state.players[target].hand.remove(pos);
-        self.emit(format!(
+        emit!(self, format!(
             "{} blindly steals a card from {}.",
             self.state.players[actor].name, self.state.players[target].name
         ));
@@ -1806,7 +1827,7 @@ impl GameEngine {
     fn wormhole_chart_steal(&mut self, actor: usize, target: usize) {
         let opts = self.chart_target_options(target, false);
         if opts.is_empty() {
-            self.emit(format!(
+            emit!(self, format!(
                 "Wormhole: {}'s Star Chart has no valid targets.",
                 self.state.players[target].name
             ));
@@ -1841,16 +1862,16 @@ impl GameEngine {
                             self.state.players[actor]
                                 .star_chart
                                 .attach_discovery(sid, card_id, dn);
-                            self.emit(format!(
-                                "Wormhole: {} takes {} — attached to existing system.",
+                            emit!(self, format!(
+                                "Wormhole: {} takes {} - attached to existing system.",
                                 self.state.players[actor].name, dn
                             ));
                         }
                         None => {
                             if let Some(c) = self.state.reconstruct(card_id) {
                                 self.state.players[actor].hand.push(c);
-                                self.emit(format!(
-                                    "Wormhole: {} takes {} — added to hand.",
+                                emit!(self, format!(
+                                    "Wormhole: {} takes {} - added to hand.",
                                     self.state.players[actor].name, dn
                                 ));
                             }
@@ -1858,7 +1879,7 @@ impl GameEngine {
                     }
                     // A Planet of Life omen attached to the stolen Discovery does
                     // not travel with it (rules: destroyed when its host Rocky
-                    // Planet leaves) — but the physical card must still return
+                    // Planet leaves) - but the physical card must still return
                     // to the deck rather than vanish from the game entirely.
                     if let Some(pol_id) = freed_pol_id {
                         if let Some(c) = self.state.reconstruct(pol_id) {
@@ -1885,7 +1906,7 @@ impl GameEngine {
         // Dark Matter Void restricted class (does not apply to the caster)
         let restricted: Option<u8> = self.state.dark_matter_void.as_ref().filter(|d| d.caster_idx != player_idx).map(|d| d.restricted_class);
 
-        // Supernova trio — requires at least 1 complete Solar System as prerequisite
+        // Supernova trio - requires at least 1 complete Solar System as prerequisite
         let has_f = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaFusion)));
         let has_g = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGravity)));
         let has_s = p.hand.iter().any(|c| matches!(&c.kind, CardKind::Flare(FlareName::SupernovaGas)));
@@ -1911,7 +1932,7 @@ impl GameEngine {
                     }
                 }
                 CardKind::Discovery(_) => {
-                    for sys in p.star_chart.incomplete_systems() {
+                    for sys in p.star_chart.incomplete_iter() {
                         actions.push(Action::PlayDiscovery { card: card.id, onto_star: sys.star_id });
                     }
                 }
@@ -1981,9 +2002,9 @@ impl GameEngine {
             if restricted.map_or(false, |r| r == class) { continue; }
             if disc_ids.len() < class as usize { continue; }
 
-            for combo in combinations(&disc_ids, class as usize) {
-                actions.push(Action::PlaySolarSystem { star: star.id, discoveries: combo });
-            }
+            for_each_combination(&disc_ids, class as usize, |combo| {
+                actions.push(Action::PlaySolarSystem { star: star.id, discoveries: combo.to_vec() });
+            });
         }
     }
 
@@ -2025,8 +2046,14 @@ impl GameEngine {
             })
             .collect();
 
-        // Pass recent log so the LLM has narrative context for its decision.
-        let history = {
+        // Batch simulations run silent with no observer, so `emit()` has
+        // discarded every narrative log line. Avoid locking and scanning the
+        // empty log on each simulated decision; this path is exercised many
+        // times per training/search game. Preserve the observer case because
+        // observer-backed games still collect log messages while silent.
+        let history = if self.silent && self.observer.is_none() {
+            Vec::new()
+        } else {
             let log = self.log.lock().unwrap();
             let start = log.len().saturating_sub(30);
             log[start..].iter()
@@ -2063,7 +2090,7 @@ impl GameEngine {
             }
         }
         if drawn > 0 {
-            self.emit(format!(
+            emit!(self, format!(
                 "  {} draws {}.",
                 self.state.players[player_idx].name, drawn
             ));
@@ -2146,7 +2173,7 @@ impl GameEngine {
         let mut file = fs::File::create(&path)?;
 
         // Header
-        writeln!(file, "NOVACANA — Game Log")?;
+        writeln!(file, "NOVACANA - Game Log")?;
         writeln!(file, "Winner : {} ({})", result.winner_name, cond)?;
         writeln!(file, "Turns  : {}", result.turns_elapsed)?;
         writeln!(file, "Players: {}", self.state.players.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))?;
@@ -2169,21 +2196,34 @@ impl GameEngine {
 
 // ── Combination enumeration ───────────────────────────────────────────────────
 
-fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
-    if k == 0 {
-        return vec![vec![]];
-    }
-    if items.len() < k {
-        return vec![];
-    }
-    let mut result = Vec::new();
-    for i in 0..=(items.len() - k) {
-        for mut combo in combinations(&items[i + 1..], k - 1) {
-            combo.insert(0, items[i].clone());
-            result.push(combo);
+fn for_each_combination<T: Clone>(items: &[T], k: usize, mut visit: impl FnMut(&[T])) {
+    fn visit_from<T: Clone>(
+        items: &[T],
+        start: usize,
+        remaining: usize,
+        chosen: &mut Vec<T>,
+        visit: &mut impl FnMut(&[T]),
+    ) {
+        if remaining == 0 {
+            visit(chosen);
+            return;
+        }
+        if items.len().saturating_sub(start) < remaining {
+            return;
+        }
+        let last = items.len() - remaining;
+        for i in start..=last {
+            chosen.push(items[i].clone());
+            visit_from(items, i + 1, remaining - 1, chosen, visit);
+            chosen.pop();
         }
     }
-    result
+
+    if k > items.len() {
+        return;
+    }
+    let mut chosen = Vec::with_capacity(k);
+    visit_from(items, 0, k, &mut chosen, &mut visit);
 }
 
 // ── Simulation correctness tests ────────────────────────────────────────────
@@ -2192,7 +2232,7 @@ fn combinations<T: Clone>(items: &[T], k: usize) -> Vec<Vec<T>> {
 // player on every `from_state` resume) went undetected for weeks: it never
 // panicked, it just silently corrupted every simulated/searched game. The
 // tests below are the regression coverage for that bug plus its general
-// class — state-fidelity drift across `from_state`, card accounting drift
+// class - state-fidelity drift across `from_state`, card accounting drift
 // over the course of play, and (where it actually holds) determinism.
 
 #[cfg(test)]
@@ -2247,7 +2287,7 @@ mod tests {
     /// star chart (stars + discoveries), and every player's attached omens
     /// (Solar Eclipse + Planet of Life + floating omens from board wipes).
     /// A card appearing 0 times means it vanished from the game; appearing
-    /// 2+ times means it was duplicated — both are silent-corruption bugs
+    /// 2+ times means it was duplicated - both are silent-corruption bugs
     /// this is meant to catch the moment they're introduced.
     fn assert_card_conservation(state: &GameState, when: &str) {
         let mut seen: HashMap<CardId, u32> = HashMap::new();
@@ -2292,8 +2332,8 @@ mod tests {
 
         assert!(engine.state.hands_dealt);
         for p in &engine.state.players {
-            // Dealt 5, then only the active player draws (+1) and — since
-            // PassPlayer never plays a card — discards straight back down to
+            // Dealt 5, then only the active player draws (+1) and - since
+            // PassPlayer never plays a card - discards straight back down to
             // the 5-card limit (-1) at end of turn. Net: everyone at 5.
             assert_eq!(
                 p.hand.len(), 5,
@@ -2305,7 +2345,7 @@ mod tests {
     #[test]
     fn from_state_does_not_redeal_hands() {
         // The actual bug: `run()`, when resumed via `from_state` (the path
-        // used by EVERY simulation/search caller — MCTS, CPU 1-ply search,
+        // used by EVERY simulation/search caller - MCTS, CPU 1-ply search,
         // chain-response search), used to re-deal 5 fresh cards to every
         // player. PassPlayer makes the one extra turn this test plays fully
         // deterministic, so any deviation from "everyone still has 5 cards"
@@ -2332,7 +2372,7 @@ mod tests {
             resumed.state.players.iter().map(|p| p.hand.len()).collect();
         assert_eq!(
             hand_sizes_after, vec![5, 5, 5, 5],
-            "hand sizes changed after resuming via from_state and running one turn — looks like a re-deal"
+            "hand sizes changed after resuming via from_state and running one turn - looks like a re-deal"
         );
     }
 
@@ -2399,14 +2439,14 @@ mod tests {
     // same 4-turn-old snapshot, played out another ~400 turns): 19/20 runs
     // diverged in winner, turn count, final hand sizes, and deck order.
     // Root cause is NOT AdvCPU's decision logic (that part IS a pure
-    // function of view/state — see the test below) but unseeded
+    // function of view/state - see the test below) but unseeded
     // `rand::thread_rng()`/`rand::random()` calls reachable through entirely
     // ordinary play: `Deck::shuffle`/`shuffle_in` (used by Protostar,
-    // Ignition, Shockwave, Black Hole, Pulsar, Stellar Nursery Collapse —
+    // Ignition, Shockwave, Black Hole, Pulsar, Stellar Nursery Collapse -
     // all common cards) and `wormhole_blind_steal`'s random hand-position
     // pick. This is pre-existing engine behavior, not something introduced
     // by today's changes, and out of scope to fix here (would mean
-    // threading a seeded RNG through the whole engine) — reported instead of
+    // threading a seeded RNG through the whole engine) - reported instead of
     // forced. A hard `assert_eq!` on repeated `run()` outputs would be
     // permanently flaky, so it's deliberately not asserted here.
     #[test]

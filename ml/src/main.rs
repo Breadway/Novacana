@@ -468,7 +468,7 @@ impl Player for MlHybridPlayer {
 // ── Lookahead eval player (ML policy, 1-step value lookahead candidates) ─────
 // Like MlHybridPlayer (AdvCPU aux paths) but disambiguates concrete actions by
 // applying each candidate to a cloned state and reading the value head on the
-// successor (mcts::value_lookahead) — no candidate head involved.
+// successor (mcts::value_lookahead) - no candidate head involved.
 
 struct MlLookaheadPlayer {
     name_str: String,
@@ -873,7 +873,7 @@ impl Player for ExpertFitRecorder {
     }
 }
 
-// Recorder variant that PLAYS as ExpertCpu (sim search) while recording —
+// Recorder variant that PLAYS as ExpertCpu (sim search) while recording -
 // used for the policy-iteration refit so weights are fit on states the
 // improved policy actually reaches.
 struct ExpertPlayRecorder {
@@ -1097,7 +1097,7 @@ fn run_pretrain_burn<B: AutodiffBackend>(
 
     // Dedicated held-out validation set for policy-generalization checkpointing.
     // Generated independently of the training data (and from the same AdvCPU
-    // process — no covariate shift), so val argmax-accuracy ≈ fidelity accuracy.
+    // process - no covariate shift), so val argmax-accuracy ≈ fidelity accuracy.
     let val_samples: Vec<ImitateSample> = if val_games > 0 {
         let v = generate_imitate_data(val_games, num_players);
         let vp = v.iter().filter(|s| s.has_policy).count();
@@ -1247,7 +1247,7 @@ fn cmd_pretrain(args: &[String]) {
         let fresh = Net::new().to_weights();
         assert_eq!(w.w1.len(), fresh.w1.len(), "trunk dims of {} don't match this build", model_path);
         if w.wc1.len() != fresh.wc1.len() || w.wc2.len() != fresh.wc2.len() {
-            println!("Warm start from {}: cand head dims changed — reinitializing cand head only", model_path);
+            println!("Warm start from {}: cand head dims changed - reinitializing cand head only", model_path);
             w.wc1 = fresh.wc1; w.bc1 = fresh.bc1;
             w.wc2 = fresh.wc2; w.bc2 = fresh.bc2;
         } else {
@@ -1323,7 +1323,7 @@ fn run_rl_burn<B: AutodiffBackend>(
         if iter > 0 && iter % snapshot_every == 0 {
             snapshot_pool.push(Arc::new(ndarray_weights.clone()));
             if snapshot_pool.len() > pool_cap { snapshot_pool.remove(0); }
-            println!("  [snapshot — pool {}]", snapshot_pool.len());
+            println!("  [snapshot - pool {}]", snapshot_pool.len());
         }
 
         let frac          = iter as f32 / num_iters.saturating_sub(1).max(1) as f32;
@@ -1359,7 +1359,7 @@ fn run_rl_burn<B: AutodiffBackend>(
                     let mut cand_f:    Vec<Vec<f32>> = Vec::new();
                     let mut cand_d:    Vec<Vec<f32>> = Vec::new();
                     let mut cand_ch:   Vec<u8>       = Vec::new();
-                    // Buffer indices actually used, parallel to feats — the loop
+                    // Buffer indices actually used, parallel to feats - the loop
                     // below skips samples failing the legal_mask check, so this
                     // can't just be `indices`.
                     let mut used_idx:  Vec<usize>    = Vec::new();
@@ -1410,7 +1410,7 @@ fn run_rl_burn<B: AutodiffBackend>(
                         let mean = cand_adv.iter().sum::<f32>() / cand_adv.len() as f32;
                         let adv_c: Vec<f32> = cand_adv.iter().map(|a| (a - mean).clamp(-2.0, 2.0)).collect();
                         // freeze_trunk: noisy REINFORCE gradients must not
-                        // move the shared body — PPO owns trunk updates. The
+                        // move the shared body - PPO owns trunk updates. The
                         // v4 run's post-peak decline (25.0→21.3 over 50 iters)
                         // tracked exactly this leakage.
                         let (nb3, _) = cand_step_burn(
@@ -1438,7 +1438,7 @@ fn run_rl_burn<B: AutodiffBackend>(
             let wr = eval(&net_arc, eval_games, num_players, EvalMode::Full);
             let star = if wr > best_eval { "  *best" } else { "" };
             println!("  Eval @ iter {}: {:.1}%  ({} games){}", iter + 1, wr * 100.0, eval_games, star);
-            // Peaks are real deliverables — never lose one to a later decline.
+            // Peaks are real deliverables - never lose one to a later decline.
             if wr > best_eval {
                 best_eval = wr;
                 let best_path = out_path.replace(".bin", "_best.bin");
@@ -1481,7 +1481,7 @@ fn cmd_rl(args: &[String]) {
     ).unwrap();
     let initial_weights = if !model_path.is_empty() {
         net::load_weights(&model_path).unwrap_or_else(|e| {
-            eprintln!("Warning: could not load {}: {} — starting fresh", model_path, e);
+            eprintln!("Warning: could not load {}: {} - starting fresh", model_path, e);
             Net::new().to_weights()
         })
     } else { Net::new().to_weights() };
@@ -1531,7 +1531,7 @@ fn run_az_burn<B: AutodiffBackend>(
         if iter > 0 && iter % snapshot_every == 0 {
             snapshot_pool.push(Arc::new(ndarray_weights.clone()));
             if snapshot_pool.len() > pool_cap { snapshot_pool.remove(0); }
-            println!("  [snapshot — pool {}]", snapshot_pool.len());
+            println!("  [snapshot - pool {}]", snapshot_pool.len());
         }
 
         let t0 = Instant::now();
@@ -1586,7 +1586,7 @@ fn run_az_burn<B: AutodiffBackend>(
                         let cand_chosen: Vec<u8>       = chunk.iter().map(|&i| replay[i].cand_chosen).collect();
                         // REINFORCE weight (chosen = the head's own SAMPLED
                         // pick). Mean-centered per batch (baseline) and trunk
-                        // frozen — both lessons from the PPO legs.
+                        // frozen - both lessons from the PPO legs.
                         let raw_adv: Vec<f32> = chunk.iter()
                             .map(|&i| replay[i].outcome - replay[i].value_est).collect();
                         let mean = raw_adv.iter().sum::<f32>() / raw_adv.len() as f32;
@@ -1652,7 +1652,7 @@ fn cmd_az(args: &[String]) {
     ).unwrap();
     let initial_weights = if !model_path.is_empty() {
         net::load_weights(&model_path).unwrap_or_else(|e| {
-            eprintln!("Warning: could not load {}: {} — starting fresh", model_path, e);
+            eprintln!("Warning: could not load {}: {} - starting fresh", model_path, e);
             Net::new().to_weights()
         })
     } else { Net::new().to_weights() };

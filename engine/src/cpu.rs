@@ -85,17 +85,17 @@ impl Player for CpuPlayer {
 // ── Action scoring ────────────────────────────────────────────────────────────
 
 fn score_action(action: &Action, view: &GameView) -> i32 {
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
     let leader_systems = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max()
         .unwrap_or(0);
 
     match action {
         Action::Pass => 0,
 
-        // Instant win — always take it
+        // Instant win - always take it
         Action::PlaySupernovas { .. } => 1_000_000,
 
         // Play star + discoveries as a set
@@ -123,7 +123,7 @@ fn score_action(action: &Action, view: &GameView) -> i32 {
             match &card.kind {
                 // Supernovas are only useful as a trio via PlaySupernovas
                 CardKind::Flare(n) if n.is_supernova() => -100,
-                // CosmicDenial is a reactive card — wasteful to proactively play
+                // CosmicDenial is a reactive card - wasteful to proactively play
                 CardKind::Flare(FlareName::CosmicDenial) => 15,
                 CardKind::Flare(FlareName::StellarAlignment) => 115,
                 CardKind::Flare(FlareName::Wormhole) => 105,
@@ -176,7 +176,7 @@ fn score_discovery(onto_star: CardId, view: &GameView, my_complete: usize) -> i3
     let needed = sys.class as usize;
 
     if after >= needed {
-        // Completes the system — weight by how close we are to winning
+        // Completes the system - weight by how close we are to winning
         match my_complete {
             2 => 1600, // this wins the game
             1 => 750,
@@ -222,15 +222,15 @@ fn score_star(id: CardId, view: &GameView) -> i32 {
 fn score_chain_response(resp: &ChainAction, view: &GameView, chain: &ChainView) -> i32 {
     let Some(card) = find_card(&view.my_hand, resp.card) else { return 0 };
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     let leader_systems = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max()
         .unwrap_or(0);
 
     match &card.kind {
         CardKind::Flare(FlareName::CosmicDenial) => {
-            // Only count opponent links as threats — never negate own cards
+            // Only count opponent links as threats - never negate own cards
             let my_tag = format!("Player {}", view.my_idx);
             let opponent_link = |l: &crate::chain::ChainLinkView| !l.negated && l.player_name != my_tag;
 
@@ -345,7 +345,7 @@ fn best_class_to_block(opts: &[String], view: &GameView) -> usize {
 }
 
 fn best_nursery_pick(opts: &[String]) -> usize {
-    // Bury supernovas — send them to the bottom so opponents can't Shockwave into them
+    // Bury supernovas - send them to the bottom so opponents can't Shockwave into them
     for (i, opt) in opts.iter().enumerate() {
         if opt.to_lowercase().contains("supernova") {
             return i;
@@ -371,17 +371,17 @@ fn score_target(target: &Target, view: &GameView) -> i32 {
         Target::Player(idx) => {
             if *idx == view.my_idx { return -100; }
             let opp = view.opponents.iter().find(|o| o.idx == *idx);
-            opp.map(|o| o.star_chart.complete_systems().len() as i32 * 100).unwrap_or(0)
+            opp.map(|o| o.star_chart.complete_count() as i32 * 100).unwrap_or(0)
         }
         Target::StarChartCard { player_idx, .. } => {
             if *player_idx == view.my_idx { return -50; }
             let opp = view.opponents.iter().find(|o| o.idx == *player_idx);
-            opp.map(|o| o.star_chart.complete_systems().len() as i32 * 80).unwrap_or(0)
+            opp.map(|o| o.star_chart.complete_count() as i32 * 80).unwrap_or(0)
         }
         Target::HandCard { player_idx, .. } => {
             if *player_idx == view.my_idx { return -50; }
             let opp = view.opponents.iter().find(|o| o.idx == *player_idx);
-            opp.map(|o| o.star_chart.complete_systems().len() as i32 * 60).unwrap_or(0)
+            opp.map(|o| o.star_chart.complete_count() as i32 * 60).unwrap_or(0)
         }
         Target::StarClass(class) => {
             // Prefer blocking classes opponents are actively building
@@ -398,10 +398,10 @@ fn score_target(target: &Target, view: &GameView) -> i32 {
 
 fn card_keep_value(card: &Card, view: &GameView) -> i32 {
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
 
     match &card.kind {
-        // Never discard supernovas — they're part of an instant-win combo
+        // Never discard supernovas - they're part of an instant-win combo
         CardKind::Flare(n) if n.is_supernova() => 1000,
 
         CardKind::Fracture(FractureName::Shockwave) => match supernovas {
@@ -522,10 +522,10 @@ impl Player for AdvancedCpuPlayer {
 // ── Adv action scoring ────────────────────────────────────────────────────────
 
 fn adv_score_action(action: &Action, view: &GameView) -> i32 {
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
     let leader_complete = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max()
         .unwrap_or(0);
     let max_threat = max_opp_threat(view);
@@ -702,7 +702,7 @@ fn adv_score_fracture_proactive(
                         .count() as i32
                 })
                 .sum();
-            let my_protected = view.my_star_chart.complete_systems().iter()
+            let my_protected = view.my_star_chart.complete_iter()
                 .filter(|s| s.is_eclipse_protected())
                 .count() as i32;
             let my_exposed = my_complete as i32 - my_protected;
@@ -763,9 +763,9 @@ fn adv_score_fracture_proactive(
 fn adv_score_chain_response(resp: &ChainAction, view: &GameView, chain: &ChainView) -> i32 {
     let Some(card) = find_card(&view.my_hand, resp.card) else { return 0 };
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     let leader_complete = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max()
         .unwrap_or(0);
 
@@ -813,7 +813,7 @@ fn adv_score_chain_response(resp: &ChainAction, view: &GameView, chain: &ChainVi
                         .count() as i32
                 })
                 .sum();
-            let my_protected = view.my_star_chart.complete_systems().iter()
+            let my_protected = view.my_star_chart.complete_iter()
                 .filter(|s| s.is_eclipse_protected())
                 .count() as i32;
             let my_exposed = my_complete as i32 - my_protected;
@@ -895,7 +895,7 @@ fn adv_decision(view: &GameView, request: &ChoiceRequest, player_name: &str) -> 
     }
     // Solar Eclipse maintenance: pay if we have cards and the system is valuable
     if prompt.contains("solar eclipse") && prompt.contains("pay") {
-        let my_complete = view.my_star_chart.complete_systems().len();
+        let my_complete = view.my_star_chart.complete_count();
         return if !view.my_hand.is_empty() && my_complete >= 1 { 0 } else { 1 };
     }
 
@@ -903,7 +903,7 @@ fn adv_decision(view: &GameView, request: &ChoiceRequest, player_name: &str) -> 
 }
 
 fn adv_wormhole_mode(view: &GameView) -> usize {
-    // Mode 1 (steal from star chart) is almost always better — we pick what to take
+    // Mode 1 (steal from star chart) is almost always better - we pick what to take
     let chart_stealable = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter()
             .any(|s| !s.is_eclipse_protected() && !s.discoveries.is_empty())
@@ -912,7 +912,7 @@ fn adv_wormhole_mode(view: &GameView) -> usize {
 }
 
 fn adv_ignition_mode(view: &GameView) -> usize {
-    // Mode 0: destroy Gas Giant from star chart (better — destroys it)
+    // Mode 0: destroy Gas Giant from star chart (better - destroys it)
     let gas_in_chart = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter().any(|s| s.has_gas_giant() && !s.is_eclipse_protected())
     });
@@ -920,8 +920,8 @@ fn adv_ignition_mode(view: &GameView) -> usize {
 }
 
 fn adv_athena_mode(view: &GameView) -> usize {
-    // Mode 0: destroy any Discovery (default — more flexible)
-    // Mode 1: return Gas Giant to hand — only if taking it breaks a complete system
+    // Mode 0: destroy any Discovery (default - more flexible)
+    // Mode 1: return Gas Giant to hand - only if taking it breaks a complete system
     let breaks_complete = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter()
             .any(|s| s.has_gas_giant() && !s.is_eclipse_protected() && s.is_complete())
@@ -984,7 +984,7 @@ fn adv_worst_card_idx(view: &GameView) -> usize {
 
 fn adv_nursery_pick(opts: &[String], view: &GameView) -> usize {
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    // Bury supernovas to deny Shockwave access — unless we already have 2 (then keep near top)
+    // Bury supernovas to deny Shockwave access - unless we already have 2 (then keep near top)
     if supernovas < 2 {
         if let Some(i) = opts.iter().position(|o| o.to_lowercase().contains("supernova")) {
             return i;
@@ -1055,9 +1055,9 @@ fn adv_score_target(target: &Target, view: &GameView, _prompt: &str, label: &str
 
 fn adv_card_keep_value(card: &Card, view: &GameView) -> i32 {
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     let leader_complete = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max()
         .unwrap_or(0);
     let has_incomplete = !view.my_star_chart.incomplete_systems().is_empty();
@@ -1119,8 +1119,8 @@ fn adv_card_keep_value(card: &Card, view: &GameView) -> i32 {
 // ── Adv helpers ───────────────────────────────────────────────────────────────
 
 fn opp_threat(opp: &OpponentView) -> i32 {
-    let complete = opp.star_chart.complete_systems().len() as i32 * 300;
-    let near: i32 = opp.star_chart.incomplete_systems().iter()
+    let complete = opp.star_chart.complete_count() as i32 * 300;
+    let near: i32 = opp.star_chart.incomplete_iter()
         .map(|s| {
             let rem = s.class as usize - s.discoveries.len();
             match rem { 1 => 120, 2 => 50, _ => 15 }
@@ -1158,8 +1158,8 @@ impl Player for EasyCpuPlayer {
             return i;
         }
         // 40% random, 60% simplified heuristic
-        if rand::random::<u8>() % 10 < 4 {
-            return rand::random::<usize>() % legal_actions.len();
+        if crate::random::random::<u8>() % 10 < 4 {
+            return crate::random::random::<usize>() % legal_actions.len();
         }
         legal_actions.iter().enumerate()
             .max_by_key(|(_, a)| easy_score_action(a, view))
@@ -1175,15 +1175,15 @@ impl Player for EasyCpuPlayer {
     ) -> Option<usize> {
         if legal_responses.is_empty() { return None; }
         // Responds only 20% of the time, always randomly
-        if rand::random::<u8>() % 10 < 2 {
-            Some(rand::random::<usize>() % legal_responses.len())
+        if crate::random::random::<u8>() % 10 < 2 {
+            Some(crate::random::random::<usize>() % legal_responses.len())
         } else {
             None
         }
     }
 
     fn decide(&self, _view: &GameView, request: &ChoiceRequest) -> usize {
-        rand::random::<usize>() % request.options.len().max(1)
+        crate::random::random::<usize>() % request.options.len().max(1)
     }
 
     fn pick_targets(
@@ -1223,7 +1223,7 @@ fn easy_score_action(action: &Action, view: &GameView) -> i32 {
                 .unwrap_or(50)
         }
         Action::PlayProtostar { .. } => 85,
-        Action::PlayFlare(_) | Action::PlayFracture(_) => (rand::random::<u8>() % 40) as i32 + 10,
+        Action::PlayFlare(_) | Action::PlayFracture(_) => (crate::random::random::<u8>() % 40) as i32 + 10,
         Action::PlayOmen { .. } => 45,
     }
 }
@@ -1237,7 +1237,7 @@ fn find_card<'a>(hand: &'a [Card], id: CardId) -> Option<&'a Card> {
 /// Rough measure of how close the most threatening opponent is to winning.
 fn opponent_danger(view: &GameView) -> i32 {
     view.opponents.iter().map(|o| {
-        let complete = o.star_chart.complete_systems().len() as i32 * 100;
+        let complete = o.star_chart.complete_count() as i32 * 100;
         let progress: i32 = o.star_chart.systems.iter()
             .filter(|s| !s.is_complete())
             .map(|s| s.discoveries.len() as i32 * 10 / s.class.max(1) as i32)
@@ -1276,7 +1276,7 @@ const EXPERT_SIM_SAMPLES: usize = 2;
 
 // Plays `forced` on its first action. Follow-up decisions in the SAME round
 // (a second action if still over the hand limit, e.g. after a Protostar
-// draw) are expert-searched too when `search_followups` is set — bounded to
+// draw) are expert-searched too when `search_followups` is set - bounded to
 // top-3 AdvCPU-prefiltered candidates, 1 sample each, and always recursing
 // with search_followups=false so nesting can't blow up. Without the flag
 // (used for the inner "rest of round" resolution) it's plain AdvCPU, as before.
@@ -1288,6 +1288,24 @@ struct ForcedThenAdv {
 }
 
 const FOLLOWUP_TOPK: usize = 6; // tuned: 3→36.8%, 6→37.9%, 12→37.1% (flat past 6)
+
+// Tried, measured, reverted (2026-07-16, Fable 5 consult + follow-up
+// verification): a FOLLOWUP_TOPK-style AdvCPU-score prefilter on the
+// PRIMARY choose_action_with_state loop below, to cut its full-sim cost on
+// the large legal sets a discovery-rich hand can produce. Direct
+// before/after measurement via the new az::tests::
+// expertcpu_vs_advcpu_teacher_strength regression test: baseline (no
+// prefilter) 47.5%±0.9 vs 3 AdvCPU; K=10 measured 38.15% (n=2000); K=20
+// measured 36.45% (n=2000) - a real ~9-11pp drop, not noise (SE~1.1% at
+// this n), and NOT recovering as K widened, meaning the problem isn't "K
+// too small," it's that adv_score_action's static heuristic (tuned for
+// AdvancedCpuPlayer's own greedy pick) is a poor proxy for which
+// candidates are worth ExpertCpu's real simulated-rollout evaluation at
+// this specific, highest-leverage decision point - unlike the
+// follow-up/chain-response searches, where the same heuristic was
+// validated to hold up (see FOLLOWUP_TOPK's own tuning note above).
+// Left exhaustive; do not re-attempt this exact approach without a better
+// prefilter signal than adv_score_action.
 
 impl Player for ForcedThenAdv {
     fn name(&self) -> &str { "forced-adv" }
@@ -1348,7 +1366,7 @@ pub const EXPERT_NF: usize = 32;
 
 pub fn expert_features(view: &GameView) -> [f32; EXPERT_NF] {
     let mut f = [0.0f32; EXPERT_NF];
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     f[0] = (my_complete == 1) as i32 as f32;
     f[1] = (my_complete >= 2) as i32 as f32;
 
@@ -1373,7 +1391,7 @@ pub fn expert_features(view: &GameView) -> [f32; EXPERT_NF] {
     f[5] = rem1.min(2) as f32 / 2.0;
     f[6] = reachable.min(2) as f32 / 2.0;
     f[7] = (low_class / 3.0).min(1.0);
-    f[8] = view.my_star_chart.complete_systems().iter()
+    f[8] = view.my_star_chart.complete_iter()
         .filter(|s| s.is_eclipse_protected()).count().min(2) as f32 / 2.0;
 
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
@@ -1388,7 +1406,7 @@ pub fn expert_features(view: &GameView) -> [f32; EXPERT_NF] {
     f[13] = (disc_in_hand.min(5) as f32) / 5.0;
 
     let leader_complete = view.opponents.iter()
-        .map(|o| o.star_chart.complete_systems().len())
+        .map(|o| o.star_chart.complete_count())
         .max().unwrap_or(0);
     f[14] = (leader_complete == 1) as i32 as f32;
     f[15] = (leader_complete >= 2) as i32 as f32;
@@ -1397,11 +1415,11 @@ pub fn expert_features(view: &GameView) -> [f32; EXPERT_NF] {
     let mut opp_eclipse = 0usize;
     let mut opp_hand = 0usize;
     for opp in &view.opponents {
-        for sys in opp.star_chart.incomplete_systems() {
+        for sys in opp.star_chart.incomplete_iter() {
             opp_filled += sys.discoveries.len();
             if sys.class as usize - sys.discoveries.len() == 1 { opp_rem1 += 1; }
         }
-        opp_eclipse += opp.star_chart.complete_systems().iter()
+        opp_eclipse += opp.star_chart.complete_iter()
             .filter(|s| s.is_eclipse_protected()).count();
         opp_hand += opp.hand_size;
     }
@@ -1444,12 +1462,12 @@ pub fn expert_features(view: &GameView) -> [f32; EXPERT_NF] {
 
 // Logistic-regression weights fit on 789K AdvCPU self-play states
 // (`novacana-ml expertfit`, 20K games, val AUC 0.564). NOTE the weak AUC and
-// wrong-signed building terms — observational outcome regression confounds
+// wrong-signed building terms - observational outcome regression confounds
 // "behind players have unfinished boards" with causation. Kept for the
 // A/B bench record; see EXPERT_USE_FITTED.
 // Iteration 3: 32 features (interaction terms + deck-composition + turn-phase
 // added to iteration 1's 22), pure-AdvCPU data (25K games, 987K states), val
-// AUC 0.571 — marginal vs iter-1's 0.564 (interactions/phase barely move
+// AUC 0.571 - marginal vs iter-1's 0.564 (interactions/phase barely move
 // outcome prediction). Bench-test before trusting: iter-2 proved higher AUC
 // can bench WORSE.
 pub static EXPERT_W: [f32; EXPERT_NF] = [
@@ -1472,7 +1490,7 @@ fn expert_eval(view: &GameView) -> i32 {
     let mut score = 0i32;
 
     // My completed systems: superlinear (2 complete is far more than 2× 1).
-    let my_complete = view.my_star_chart.complete_systems().len();
+    let my_complete = view.my_star_chart.complete_count();
     score += match my_complete {
         0 => 0,
         1 => 1_100,
@@ -1482,13 +1500,13 @@ fn expert_eval(view: &GameView) -> i32 {
 
     // My incomplete systems: progress weighted by closeness and reachability.
     // The base term is the OPTION VALUE of having a system on the board at all
-    // — without it, 1-ply search never spends a hand card to start one (a
+    // - without it, 1-ply search never spends a hand card to start one (a
     // played star scored zero while the hand term charged full price, and the
     // first bench came out at 14%: an expert that refuses to build).
     let disc_in_hand = view.my_hand.iter()
         .filter(|c| matches!(c.kind, CardKind::Discovery(_)))
         .count();
-    for (n_sys, sys) in view.my_star_chart.incomplete_systems().iter().enumerate() {
+    for (n_sys, sys) in view.my_star_chart.incomplete_iter().enumerate() {
         let needed = sys.class as usize;
         let filled = sys.discoveries.len();
         let remaining = needed - filled;
@@ -1506,7 +1524,7 @@ fn expert_eval(view: &GameView) -> i32 {
     }
 
     // Eclipse protection on completed systems is worth a lot late.
-    score += view.my_star_chart.complete_systems().iter()
+    score += view.my_star_chart.complete_iter()
         .filter(|s| s.is_eclipse_protected())
         .count() as i32 * 220;
 
@@ -1528,19 +1546,19 @@ fn expert_eval(view: &GameView) -> i32 {
 
     // Opponents: mirror image, weighted by the strongest threat superlinearly.
     for opp in &view.opponents {
-        let oc = opp.star_chart.complete_systems().len();
+        let oc = opp.star_chart.complete_count();
         score -= match oc {
             0 => 0,
             1 => 700,
             2 => 2_600,
             _ => 50_000,
         };
-        for sys in opp.star_chart.incomplete_systems() {
+        for sys in opp.star_chart.incomplete_iter() {
             let remaining = sys.class as usize - sys.discoveries.len();
             score -= sys.discoveries.len() as i32 * 60;
             if remaining == 1 { score -= 150; }
         }
-        score -= opp.star_chart.complete_systems().iter()
+        score -= opp.star_chart.complete_iter()
             .filter(|s| s.is_eclipse_protected())
             .count() as i32 * 160;
         score -= (opp.hand_size.min(8) as i32) * 10;
@@ -1554,13 +1572,13 @@ fn expert_eval(view: &GameView) -> i32 {
 // legitimate case, not the typical one: expert_sim_action's own cap already
 // bounds the simulation to one extra round (my turn + each opponent's reply),
 // each turn itself capped at 50 actions, and each action's nested decide()
-// calls number at most a handful (Wormhole 2, Athena 2-3, QEF 4, ...) — so a
+// calls number at most a handful (Wormhole 2, Athena 2-3, QEF 4, ...) - so a
 // worst-case full round for a 4-player game is roughly
 // 50 actions * 4 players * ~5 nested decisions ~= 1000, plus chain-response
 // overhead of similar order. 3000 gives ~3x headroom over that estimate
 // without ever mattering for a normal game (a real round is a few dozen
 // decisions at most), so this exists purely to catch genuine pathological
-// blowups — the same role the 50-action-per-turn cap plays one level down.
+// blowups - the same role the 50-action-per-turn cap plays one level down.
 const SIM_MAX_DECISIONS: usize = 3000;
 
 /// Simulate applying `action` in `state`: the whole current turn resolves
@@ -1591,7 +1609,7 @@ fn expert_sim_action(state: &GameState, my_idx: usize, action: &Action, search_f
     let mut engine = GameEngine::from_state(state.clone(), players);
     engine.set_silent();
     engine.set_max_turns(cap);
-    // Additional safety net alongside max_turns/the 50-action cap — see
+    // Additional safety net alongside max_turns/the 50-action cap - see
     // SIM_MAX_DECISIONS.
     engine.set_max_decisions(SIM_MAX_DECISIONS);
     let result = engine.run();
@@ -1641,8 +1659,8 @@ impl Player for ForcedChainThenAdv {
 /// forcing the response, letting the rest of that pass-window resolve via
 /// AdvCPU, resolving the chain, then evaluating the successor with
 /// expert_eval (or the true win/loss if the chain resolution ends the game).
-/// `cursor` is the TRUE resume position the live game had reached — see
-/// `ChainResumeCursor` — so the simulated continuation asks exactly the
+/// `cursor` is the TRUE resume position the live game had reached - see
+/// `ChainResumeCursor` - so the simulated continuation asks exactly the
 /// players the real game would, no more.
 fn simulate_chain_response(
     state: &GameState,
@@ -1666,7 +1684,7 @@ fn simulate_chain_response(
     let mut engine = GameEngine::from_state(state.clone(), players);
     engine.set_silent();
     // simulate_finish_chain never enters run()'s main loop, so it gets none
-    // of max_turns'/the 50-action cap's protection otherwise — this is the
+    // of max_turns'/the 50-action cap's protection otherwise - this is the
     // one path that previously had NO cost bound at all.
     engine.set_max_decisions(SIM_MAX_DECISIONS);
     match engine.simulate_finish_chain(chain.clone(), cursor) {
@@ -1683,7 +1701,7 @@ impl Player for ExpertCpuPlayer {
         &self.name
     }
 
-    // Without a GameState there is nothing to simulate — AdvCPU scoring.
+    // Without a GameState there is nothing to simulate - AdvCPU scoring.
     fn choose_action(&self, view: &GameView, legal: &[Action]) -> usize {
         self.adv.choose_action(view, legal)
     }
@@ -1691,6 +1709,8 @@ impl Player for ExpertCpuPlayer {
     fn choose_action_with_state(&self, view: &GameView, state: &GameState, legal: &[Action]) -> usize {
         if legal.len() <= 1 { return 0; }
         let my_idx = view.my_idx;
+        // Deliberately exhaustive - see the comment above FOLLOWUP_TOPK for
+        // why a prefilter was tried here and reverted.
         legal.iter().enumerate()
             .map(|(i, a)| {
                 let total: i64 = (0..EXPERT_SIM_SAMPLES)
@@ -1721,7 +1741,7 @@ impl Player for ExpertCpuPlayer {
         }
         let my_idx = view.my_idx;
         // Prefilter to the top FOLLOWUP_TOPK candidates by AdvCPU's static
-        // score, plus "pass" always kept as its own option — mirrors the
+        // score, plus "pass" always kept as its own option - mirrors the
         // choose_action_with_state follow-up search (search only pays off
         // with a trustworthy eval behind it, which expert_eval_fitted now is).
         let mut ranked: Vec<usize> = (0..legal.len()).collect();

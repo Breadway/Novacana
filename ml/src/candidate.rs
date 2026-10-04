@@ -83,11 +83,11 @@ pub const CAND_DIM: usize = 24;
 
 // ── Candidate encoding layout ─────────────────────────────────────────────────
 //
-//  [0]  is_hand_card     — candidate is a card in hand (discard or action disambiguation)
-//  [1]  is_system        — candidate is a star chart system slot
-//  [2]  is_player        — candidate is an opponent player target
-//  [3]  is_star_class    — candidate is a star-class value (Dark Matter Void targeting)
-//  [4]  is_chain_link    — candidate is a chain link (Cosmic Denial targeting)
+//  [0]  is_hand_card     - candidate is a card in hand (discard or action disambiguation)
+//  [1]  is_system        - candidate is a star chart system slot
+//  [2]  is_player        - candidate is an opponent player target
+//  [3]  is_star_class    - candidate is a star-class value (Dark Matter Void targeting)
+//  [4]  is_chain_link    - candidate is a chain link (Cosmic Denial targeting)
 //
 //  card features (when is_hand_card == 1)
 //  [5]  card_type / 28.0
@@ -167,7 +167,7 @@ pub fn encode_system_candidate(sys: &SolarSystem, on_opponent: bool, slot: usize
 }
 
 // ── Encode a (discovery card, target system) pair (for the collapsed PlayDiscovery
-// abstract action — the candidate head jointly picks discovery type + target system)
+// abstract action - the candidate head jointly picks discovery type + target system)
 
 pub fn encode_discovery_candidate(card: &Card, sys: &SolarSystem, slot: usize, total: usize) -> [f32; CAND_DIM] {
     let mut c = [0.0f32; CAND_DIM];
@@ -298,7 +298,7 @@ pub fn encode_target_candidate(
 
         Target::ChainLink(idx) => {
             c[4]  = 1.0;
-            c[22] = *idx as f32 / 10.0; // overrides position — that's fine for chain links
+            c[22] = *idx as f32 / 10.0; // overrides position - that's fine for chain links
         }
     }
 

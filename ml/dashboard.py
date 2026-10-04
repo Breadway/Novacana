@@ -2,7 +2,7 @@
 """Astra-6 training dashboard.
 
 Live view of ALL training activity: BC pretrain runs (sweep points and
-warm-start/candidate-only runs), RL (PPO) segments, and AZ runs — parsed from
+warm-start/candidate-only runs), RL (PPO) segments, and AZ runs - parsed from
 learning_curve_out/*.log and logs/*.log. Stdlib only.
 
 Usage:  python3 dashboard.py [--port 7750]
@@ -186,12 +186,12 @@ def collect():
             if latest["kind"] == "rl":
                 li = latest["iters"][-1]["iter"] if latest["iters"] else 0
                 kind = "AZ" if latest.get("az") else "RL"
-                activity = f"{kind} {latest['name']} — iter {li}/{latest['planned_iters']}"
+                activity = f"{kind} {latest['name']} - iter {li}/{latest['planned_iters']}"
             else:
                 ph = latest["phase"]
                 n = len(latest.get({"joint": "joint", "value": "value",
                                     "candidate": "cand"}.get(ph, "joint"), []))
-                activity = f"BC {latest['name']} — {ph} {n and f'epoch {n}' or ''}"
+                activity = f"BC {latest['name']} - {ph} {n and f'epoch {n}' or ''}"
         else:
             activity = "idle"
     return {"bc": bc, "rl": rl, "sys": sys_, "activity": activity, "ts": time.time()}
@@ -283,13 +283,13 @@ footer { margin-top: 10px; font-size: 11px; color: var(--muted); }
 </header>
 <div class="tiles" id="tiles"></div>
 <div class="charts">
-  <div class="card"><h2>BC — held-out policy accuracy per epoch</h2>
+  <div class="card"><h2>BC - held-out policy accuracy per epoch</h2>
     <div id="c_acc"></div><div class="legend" id="lg_acc"></div><div class="tip" id="t_acc"></div></div>
-  <div class="card"><h2>BC — train policy cross-entropy per epoch</h2>
+  <div class="card"><h2>BC - train policy cross-entropy per epoch</h2>
     <div id="c_pce"></div><div class="legend" id="lg_pce"></div><div class="tip" id="t_pce"></div></div>
   <div class="card"><h2>Candidate-head cross-entropy per epoch</h2>
     <div id="c_cand"></div><div class="legend" id="lg_cand"></div><div class="tip" id="t_cand"></div></div>
-  <div class="card"><h2>RL — eval win rate vs iteration</h2>
+  <div class="card"><h2>RL - eval win rate vs iteration</h2>
     <div id="c_rl"></div><div class="legend" id="lg_rl"></div><div class="tip" id="t_rl"></div></div>
 </div>
 <div class="stack">
@@ -302,7 +302,7 @@ const COLORS = ['--s1','--s2','--s3','--s4','--s5','--s6','--s7','--s8'];
 const fmt  = (v, d=3) => v == null ? '·' : v.toFixed(d);
 
 // Shorten run names for labels: "8000 games" → "8K", strip the constant prefix
-// (keep version prefixes — stripping them collided v3_rl and v4_rl into "rl").
+// (keep version prefixes - stripping them collided v3_rl and v4_rl into "rl").
 function short(n) {
   const m = n.match(/^(\d+) games$/);
   if (m) return (+m[1] >= 1000 ? (+m[1] / 1000) + 'K' : m[1]);
@@ -421,7 +421,7 @@ async function refresh() {
     pts: r.joint.filter(e => e.val_acc != null).map(e => [e.epoch, e.val_acc]) }));
   const sPce = d.bc.map(r => ({ name: short(r.name), pts: r.joint.map(e => [e.epoch, e.policy]) }));
   const sCand = d.bc.map(r => ({ name: short(r.name), pts: r.cand.map(e => [e.epoch, e.loss]) }));
-  // Chart only the ACTIVE run — twelve overlaid historical curves were noise.
+  // Chart only the ACTIVE run - twelve overlaid historical curves were noise.
   // Prior runs' high-water mark becomes a reference line instead.
   const sRl = active ? [{ name: short(active.name), pts: active.evals.map(e => [e.iter, e.wr]) }] : [];
 

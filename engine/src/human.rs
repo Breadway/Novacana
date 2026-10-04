@@ -60,11 +60,11 @@ impl PromptKind {
     pub fn title(&self) -> String {
         match self {
             Self::ChooseAction { .. } => "YOUR TURN".into(),
-            Self::RespondToChain { .. } => "CHAIN OPEN — Respond or pass?".into(),
+            Self::RespondToChain { .. } => "CHAIN OPEN - Respond or pass?".into(),
             Self::Decide { prompt, .. } => prompt.clone(),
             Self::PickTarget { prompt, .. } => prompt.clone(),
             Self::ChooseDiscard { step, total, .. } => {
-                format!("DISCARD — choose {} of {}", step, total)
+                format!("DISCARD - choose {} of {}", step, total)
             }
         }
     }
@@ -95,7 +95,7 @@ fn action_card_type(action: &Action) -> Option<&'static str> {
 /// A human player that communicates via in-process channels.
 ///
 /// SERVER PATH: Replace `prompt_tx`/`response_rx` with a WebSocket connection.
-/// The `Player` trait implementation stays identical — no game-engine changes required.
+/// The `Player` trait implementation stays identical - no game-engine changes required.
 pub struct HumanPlayer {
     name: String,
     prompt_tx: SyncSender<HumanPrompt>,
@@ -167,7 +167,7 @@ impl Player for HumanPlayer {
         }
         let chain_lines = chain.links.iter().map(|l| {
             let neg = if l.negated { " (NEGATED)" } else { "" };
-            format!("CL{} [{}] {} — {}{}", l.index + 1, l.player_name, l.card.kind.type_name(), l.card, neg)
+            format!("CL{} [{}] {} - {}{}", l.index + 1, l.player_name, l.card.kind.type_name(), l.card, neg)
         }).collect();
         let options = legal_responses.iter()
             .filter_map(|r| view.my_hand.iter().find(|c| c.id == r.card))
@@ -254,7 +254,7 @@ pub fn describe_action(action: &Action, view: &GameView) -> String {
     };
 
     match action {
-        Action::Pass => "Pass — end your action phase".into(),
+        Action::Pass => "Pass - end your action phase".into(),
 
         Action::PlayStar(id) => {
             let cls = view.my_hand.iter().find(|c| c.id == *id)
@@ -299,7 +299,7 @@ pub fn describe_action(action: &Action, view: &GameView) -> String {
         }
 
         Action::PlaySupernovas { .. } => {
-            "★★★ PLAY ALL 3 SUPERNOVAS — Cosmic Cataclysm — YOU WIN!".into()
+            "★★★ PLAY ALL 3 SUPERNOVAS - Cosmic Cataclysm - YOU WIN!".into()
         }
 
         Action::PlayProtostar { card, choice } => match choice {

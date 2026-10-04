@@ -108,7 +108,7 @@ impl CliPlayer {
                     }
                 }
             }
-            println!("  (invalid — try again)");
+            println!("  (invalid - try again)");
         }
     }
 }
@@ -135,7 +135,7 @@ impl Player for CliPlayer {
         println!("\n── CHAIN IS OPEN ──");
         println!("{}", chain);
         if legal_responses.is_empty() {
-            println!("  (no legal responses — you pass)");
+            println!("  (no legal responses - you pass)");
             return None;
         }
         println!("  Your hand has {} card(s).", view.my_hand.len());
@@ -235,7 +235,7 @@ fn describe_action(action: &Action, view: &GameView, _idx: usize) -> String {
             let disc_names: Vec<String> = discoveries.iter().map(|&id| card_name(id)).collect();
             format!("Complete Solar System: {} + [{}]", card_name(*star), disc_names.join(", "))
         }
-        Action::PlaySupernovas { .. } => "⚠ PLAY ALL 3 SUPERNOVAS — Cosmic Cataclysm!".into(),
+        Action::PlaySupernovas { .. } => "⚠ PLAY ALL 3 SUPERNOVAS - Cosmic Cataclysm!".into(),
         Action::PlayProtostar { card, choice } => match choice {
             ProtostarChoice::DrawTwo => format!("Play {} → draw 2 cards", card_name(*card)),
             ProtostarChoice::SearchWhiteDwarf => {
@@ -298,7 +298,7 @@ fn run_connect(host_arg: Option<String>) {
     use novacana_engine::protocol::{ClientMsg, ServerMsg};
     use lobby::{menu, queue};
 
-    // 1 — Connect screen (or use CLI arg).
+    // 1 - Connect screen (or use CLI arg).
     let (host, port) = if let Some(arg) = host_arg {
         match arg.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
@@ -315,14 +315,14 @@ fn run_connect(host_arg: Option<String>) {
         }
     };
 
-    // 2 — Open WebSocket.
+    // 2 - Open WebSocket.
     let url = format!("ws://{}:{}/ws", host, port);
     let ws = match tungstenite::connect(&url) {
         Ok((ws, _)) => ws,
         Err(e) => { eprintln!("Failed to connect to {}: {}", url, e); return; }
     };
 
-    // 3 — Bridge channels.
+    // 3 - Bridge channels.
     let (game_event_tx, game_event_rx) = mpsc::sync_channel::<GameEvent>(256);
     let (prompt_tx, prompt_rx) = mpsc::sync_channel::<HumanPrompt>(4);
     let (lobby_tx, lobby_rx) = mpsc::sync_channel::<ServerMsg>(32);
@@ -389,20 +389,20 @@ fn run_connect(host_arg: Option<String>) {
         });
     }
 
-    // 4 — Auth screen.
+    // 4 - Auth screen.
     let username = match lobby::auth::run(&client_msg_tx, &lobby_rx) {
         Ok(Some(r)) => r.username,
         Ok(None) => return,
         Err(e) => { eprintln!("Auth error: {}", e); return; }
     };
 
-    // 5 — Drain LobbyInfo to get online count.
+    // 5 - Drain LobbyInfo to get online count.
     let mut online: u32 = 0;
     while let Ok(msg) = lobby_rx.try_recv() {
         if let ServerMsg::LobbyInfo { online: n } = msg { online = n; }
     }
 
-    // 6 — Main menu loop.
+    // 6 - Main menu loop.
     loop {
         match menu::run(&username, online) {
             Ok(menu::MenuAction::Quit) => return,
@@ -415,20 +415,20 @@ fn run_connect(host_arg: Option<String>) {
             if let ServerMsg::LobbyInfo { online: n } = msg { online = n; }
         }
 
-        // 7 — Queue.
+        // 7 - Queue.
         match queue::run(&client_msg_tx, &lobby_rx) {
             Ok(queue::QueueResult::Cancelled) => continue,
             Ok(queue::QueueResult::GameFound { .. }) => {}
             Err(e) => { eprintln!("Queue error: {}", e); return; }
         }
 
-        // 8 — Game TUI.
+        // 8 - Game TUI.
         if let Err(e) = tui::run_interactive(game_event_rx, prompt_rx, response_fwd_tx) {
             eprintln!("Game TUI error: {}", e);
             return;
         }
         // After game ends, re-borrow the channels and go back to menu.
-        // NOTE: game_event_rx and prompt_rx are consumed here — after the first
+        // NOTE: game_event_rx and prompt_rx are consumed here - after the first
         // game this would fail. Ideally we rebuild them, but for v1 the client
         // exits after one game and the user reconnects.
         return;

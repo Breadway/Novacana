@@ -147,7 +147,7 @@ pub fn encode(view: &GameView) -> [f32; FEATURE_DIM] {
     // [104..124] Play history: 4 seats × 5 card categories, counts /5.
     // Seat-relative: row 0 = my plays, rows 1-3 = opponents[0..3] by their idx.
     // The window is the last 20 global plays, so a single seat's count can
-    // exceed 5 — clamp instead of just scaling.
+    // exceed 5 - clamp instead of just scaling.
     let mut history = [[0u8; 5]; 4];
     for &(player_idx, ref kind) in &view.recent_plays {
         let seat = if player_idx == view.my_idx {

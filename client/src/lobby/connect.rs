@@ -92,7 +92,7 @@ pub fn run() -> io::Result<Option<ConnectResult>> {
                     KeyCode::Enter => {
                         match parse_host_port(&input) {
                             Some(r) => break Some(r),
-                            None => error = Some("Invalid format — use host:port (e.g. localhost:7878)".into()),
+                            None => error = Some("Invalid format - use host:port (e.g. localhost:7878)".into()),
                         }
                     }
                     KeyCode::Char(c) => {

@@ -34,7 +34,7 @@ pub struct RlSample {
     pub value:       f32,   // value estimate at decision time
     pub cand_feats:  Vec<f32>,
     pub cand_chosen: u8,
-    pub has_policy:  bool,  // false: aux cand sample (decide/targets/discards) — cand head only
+    pub has_policy:  bool,  // false: aux cand sample (decide/targets/discards) - cand head only
 }
 
 struct Pending {
@@ -50,7 +50,7 @@ struct Pending {
 }
 
 // Sample an index from softmax(scores / temp). Aux choices must be SAMPLED,
-// not argmaxed, for REINFORCE to be unbiased — with argmax, a negative
+// not argmaxed, for REINFORCE to be unbiased - with argmax, a negative
 // advantage on the current pick just thrashes between candidates.
 fn sample_scores(scores: &[f32], temp: f32, u: f32) -> usize {
     let t = temp.max(1e-6);
@@ -213,7 +213,7 @@ impl Player for SelfPlayPlayer {
     }
 
     // The three aux paths record REINFORCE candidate samples (has_policy: false)
-    // so outcome signal reaches decide/target/discard behaviour — the component
+    // so outcome signal reaches decide/target/discard behaviour - the component
     // the 2x2 eval isolated as the ~7-point win-rate bottleneck. infer_with_body
     // (not body_forward) so the pending sample carries a real value estimate and
     // the GAE chain stays consistent.
@@ -497,7 +497,7 @@ struct AzPending {
     has_cand:      bool,
 }
 
-// Sampling temperature for AZ candidate picks — fixed because the AZ loop has
+// Sampling temperature for AZ candidate picks - fixed because the AZ loop has
 // no temperature schedule. Sampled (not argmax) picks keep the REINFORCE
 // estimator unbiased, same lesson as the PPO legs.
 const AZ_CAND_TEMP: f32 = 0.35;
@@ -555,7 +555,7 @@ impl AzSelfPlayPlayer {
 impl Player for AzSelfPlayPlayer {
     fn name(&self) -> &str { &self.name_str }
 
-    // Greedy fallback when no state is available — should be rare in practice.
+    // Greedy fallback when no state is available - should be rare in practice.
     fn choose_action(&self, view: &GameView, legal: &[Action]) -> usize {
         let features = self.encode_and_stack(view);
         let mask = legal_mask(legal, &view.my_hand);

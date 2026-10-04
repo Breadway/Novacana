@@ -207,7 +207,7 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
 
     let policy_loss = -(is_t.clone() * (ppo_obj + entropy * entropy_coeff)).mean();
     // GAE returns can fall outside [0,1] due to shaped rewards while the value
-    // head is sigmoid — clamp the value-loss target only (advantage above stays
+    // head is sigmoid - clamp the value-loss target only (advantage above stays
     // on the unclamped returns).
     let value_tgt   = outcomes_t.clamp(0.0, 1.0);
     let diff        = values - value_tgt;
@@ -226,7 +226,7 @@ pub fn rl_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
 //
 // Policy loss: cross-entropy against MCTS visit distribution (soft targets).
 // Value loss:  MSE against game outcome.
-// No PPO clipping or IS weights — this is supervised learning against MCTS targets.
+// No PPO clipping or IS weights - this is supervised learning against MCTS targets.
 
 pub fn az_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
     net:         NetBurn<B>,
@@ -279,7 +279,7 @@ pub fn az_train_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>(
 // Body forward for head-only fine-tune steps. freeze=true runs the trunk on
 // the INNER (non-autodiff) backend and re-imports the activations as a
 // constant leaf. This both stops gradients at the trunk and avoids building
-// the trunk's autodiff graph at all — a detach()ed subgraph is never reached
+// the trunk's autodiff graph at all - a detach()ed subgraph is never reached
 // by backward(), and burn only frees graph state on backward, so detach leaks
 // the whole trunk graph every batch.
 fn frozen_or_live_body<B: AutodiffBackend>(
@@ -315,7 +315,7 @@ pub fn pretrain_value_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>>
     // policy-optimized trunk, preventing value MSE from degrading the policy
     // (the epoch-8→30 policy regression). Inner backend, not detach(): a
     // detached trunk subgraph is never reached by backward(), and burn only
-    // frees autodiff graph state on backward — detach leaked ~5GB/epoch.
+    // frees autodiff graph state on backward - detach leaked ~5GB/epoch.
     let body = frozen_or_live_body(&net, feat_flat, b, freeze_trunk, device);
     let values = activation::sigmoid(net.lv.forward(body));
     let tgt    = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
@@ -371,7 +371,7 @@ pub fn pretrain_policy_step_burn<B: AutodiffBackend, O: Optimizer<NetBurn<B>, B>
 /// Returns (argmax_correct_count, summed_hard_cross_entropy) so callers can
 /// accumulate across batches and checkpoint on *generalization* rather than
 /// epoch count. Takes a plain-Backend net: autodiff callers must pass
-/// `net.valid()` — forward passes on the autodiff backend accumulate graph
+/// `net.valid()` - forward passes on the autodiff backend accumulate graph
 /// state that only backward() releases (~600MB/epoch leak, earlyoom kill).
 pub fn policy_eval_burn<B: Backend>(
     net:     &NetBurn<B>,

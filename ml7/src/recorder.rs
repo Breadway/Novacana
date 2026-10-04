@@ -1,17 +1,30 @@
-// BC data generation: an AdvancedCpuPlayer-imitating recorder that emits
+// BC data generation: an ExpertCpuPlayer-imitating recorder that emits
 // (token sequence, chosen action index) samples across all five decision
 // kinds through the tokens.rs pointer-policy tokenizer. Ports the
 // `AdvCpuRecorder` shape from ml/src/main.rs, but there is no abstract
-// action layer or candidate head to split samples across anymore — every
+// action layer or candidate head to split samples across anymore - every
 // decision kind produces exactly one pointer-policy sample.
+//
+// Teacher: ExpertCpuPlayer, not AdvancedCpuPlayer (switched 2026-07-10).
+// BC's win-rate ceiling is bounded by its teacher's own skill - a perfect
+// clone of a policy IS that policy, so it cannot exceed the teacher's own
+// seat-0 win rate. AdvCPU's seat-0 baseline measured at 20.0% (n=400, see
+// az::tests::harness_has_no_seat_bias_between_equally_matched_players);
+// ExpertCpu (1-ply full-round sim search + fitted eval + bounded
+// follow-up search + chain-response search) measures 47.5%±0.9 vs 3
+// AdvCPU - over 2x the ceiling. Cost: ExpertCpu game generation is ~325x
+// slower per-game than AdvCPU (benchmarked: ~909 games/s vs ~2.8 games/s,
+// single-threaded) - but that's still only ~4 min/8000-game epoch with
+// 13-way parallelism against a ~72 min GPU-training epoch, so it doesn't
+// change the wall-clock budget meaningfully.
 
 use std::sync::{Arc, Mutex};
 
 use novacana_engine::card::CardId;
-use novacana_engine::chain::ChainView;
-use novacana_engine::cpu::AdvancedCpuPlayer;
+use novacana_engine::chain::{Chain, ChainResumeCursor, ChainView};
+use novacana_engine::cpu::ExpertCpuPlayer;
 use novacana_engine::deck::Deck;
-use novacana_engine::game::GameEngine;
+use novacana_engine::game::{GameEngine, GameState};
 use novacana_engine::player::{
     Action, ChainAction, ChoiceRequest, GameView, Player, TargetOption,
 };
@@ -24,9 +37,9 @@ struct Pending {
 }
 
 /// One BC training example: a fully assembled token sequence, the pointer
-/// target (index into the action-token block AdvCPU actually chose), and
-/// the terminal game outcome (1.0 = this seat won) used as the BC-stage
-/// value warm-start target.
+/// target (index into the action-token block the teacher actually chose),
+/// and the terminal game outcome (1.0 = this seat won) used as the
+/// BC-stage value warm-start target.
 pub struct Sample {
     pub tokens: TokenSeq,
     pub target: u16,
@@ -35,14 +48,14 @@ pub struct Sample {
 
 struct BcRecorder {
     name_str: String,
-    fallback: AdvancedCpuPlayer,
+    fallback: ExpertCpuPlayer,
     buffer: Arc<Mutex<Vec<Pending>>>,
 }
 
 impl BcRecorder {
     fn new(name: impl Into<String>, buffer: Arc<Mutex<Vec<Pending>>>) -> Self {
         let n = name.into();
-        Self { fallback: AdvancedCpuPlayer::new(n.clone()), name_str: n, buffer }
+        Self { fallback: ExpertCpuPlayer::new(n.clone()), name_str: n, buffer }
     }
 
     fn push_if_encodable(&self, view: &GameView, action_tokens: &[tokens::Token], target: u16) {
@@ -59,8 +72,33 @@ impl Player for BcRecorder {
         &self.name_str
     }
 
+    // Plain (stateless) fallbacks - the game engine always calls the
+    // `_with_state` variants below when driving real games (confirmed:
+    // `GameEngine::run`'s action-phase loop calls `choose_action_with_state`
+    // directly), so these only run for callers that genuinely lack a
+    // GameState. Kept for trait completeness/tests, not the real data path.
     fn choose_action(&self, view: &GameView, legal: &[Action]) -> usize {
         let chosen = self.fallback.choose_action(view, legal);
+        let action_tokens = tokens::encode_action_tokens_choose_action(view, legal);
+        self.push_if_encodable(view, &action_tokens, chosen as u16);
+        chosen
+    }
+
+    // Found 2026-07-10: without this override, the trait's default
+    // `choose_action_with_state` falls through to `choose_action` above,
+    // which calls `ExpertCpuPlayer::choose_action` - and THAT always
+    // delegates to its cheap `AdvancedCpuPlayer` fallback (`self.adv`),
+    // never the real search, which only lives in
+    // `ExpertCpuPlayer::choose_action_with_state`. The BC teacher swap to
+    // ExpertCpu was a no-op without this: BcRecorder was silently still
+    // training against AdvCPU-quality decisions the whole time, just
+    // under an ExpertCpu label. Caught by an arithmetic sanity check (a
+    // 200-game val-set generation took 0.2-0.3s - physically impossible
+    // for real ExpertCpu search at any plausible core count; the correct
+    // path measures multiple seconds, matching the real per-game search
+    // cost this now actually pays).
+    fn choose_action_with_state(&self, view: &GameView, state: &GameState, legal: &[Action]) -> usize {
+        let chosen = self.fallback.choose_action_with_state(view, state, legal);
         let action_tokens = tokens::encode_action_tokens_choose_action(view, legal);
         self.push_if_encodable(view, &action_tokens, chosen as u16);
         chosen
@@ -70,6 +108,24 @@ impl Player for BcRecorder {
         let result = self.fallback.respond_to_chain(view, chain, legal);
         let action_tokens = tokens::encode_action_tokens_chain(view, legal);
         // index 0 = pass (see tokens::encode_action_tokens_chain doc comment).
+        let target = result.map(|i| i + 1).unwrap_or(0) as u16;
+        self.push_if_encodable(view, &action_tokens, target);
+        result
+    }
+
+    // Same fix as choose_action_with_state above - ExpertCpuPlayer's real
+    // chain-response follow-up search only lives in this state-aware variant.
+    fn respond_to_chain_with_state(
+        &self,
+        view: &GameView,
+        state: &GameState,
+        chain_view: &ChainView,
+        chain: &Chain,
+        cursor: ChainResumeCursor,
+        legal: &[ChainAction],
+    ) -> Option<usize> {
+        let result = self.fallback.respond_to_chain_with_state(view, state, chain_view, chain, cursor, legal);
+        let action_tokens = tokens::encode_action_tokens_chain(view, legal);
         let target = result.map(|i| i + 1).unwrap_or(0) as u16;
         self.push_if_encodable(view, &action_tokens, target);
         result
@@ -118,7 +174,7 @@ fn run_one_game(num_players: usize) -> Vec<Sample> {
     for i in 0..num_players {
         let buf = Arc::new(Mutex::new(Vec::new()));
         bufs.push(Arc::clone(&buf));
-        players.push(Box::new(BcRecorder::new(format!("AdvCPU{}", i + 1), buf)));
+        players.push(Box::new(BcRecorder::new(format!("ExpertCPU{}", i + 1), buf)));
     }
     let mut engine = GameEngine::new(Deck::build_classic(), players);
     engine.set_silent();
@@ -139,13 +195,37 @@ fn run_one_game(num_players: usize) -> Vec<Sample> {
     out
 }
 
-/// Generate BC samples from `num_games` fresh self-play games (AdvCPU vs
+/// Generate BC samples from `num_games` fresh self-play games (ExpertCPU vs
 /// itself, `num_players` seats). Streams: caller controls how many games are
-/// live in memory at once by calling this in chunks — never pregenerate more
-/// than ~8-10K games at once (ASTRA7.md §8.3 — hermes runs earlyoom).
+/// live in memory at once by calling this in chunks - never pregenerate more
+/// than ~8-10K games at once (ASTRA7.md §8.3 - hermes runs earlyoom).
 pub fn generate_samples(num_games: usize, num_players: usize) -> Vec<Sample> {
+    generate_samples_abortable(num_games, num_players, None)
+}
+
+pub fn benchmark_samples(seed: u64) -> Vec<Sample> {
+    novacana_engine::random::with_seed(seed, || run_one_game(4))
+}
+
+/// Same as `generate_samples`, but checks `abort` (if given) before starting
+/// each game and skips remaining ones once it's set - lets a graceful-
+/// shutdown request (2026-07-10, run_bc's module doc) take effect within
+/// roughly one game's duration instead of waiting out the whole chunk
+/// (chunk-games=2000+ self-play generation can otherwise take minutes,
+/// which is a bad "I need my computer back now" experience). Games already
+/// in flight when `abort` flips still finish naturally - this only stops
+/// new ones from starting, not a mid-game kill.
+pub fn generate_samples_abortable(num_games: usize, num_players: usize, abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Vec<Sample> {
     use rayon::prelude::*;
-    (0..num_games).into_par_iter().flat_map(|_| run_one_game(num_players)).collect()
+    (0..num_games)
+        .into_par_iter()
+        .flat_map(|_| {
+            if abort.as_ref().is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Vec::new();
+            }
+            run_one_game(num_players)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -175,7 +255,7 @@ mod tests {
         }
 
         // Sanity: choose_action (kind 0..10) and chain/decide/target/discard
-        // (kind 11..15) should BOTH appear across 20 real games — if one
+        // (kind 11..15) should BOTH appear across 20 real games - if one
         // decision kind is silently never recorded, that's a tokenizer bug,
         // not a game-rules quirk (every game has discards and most have
         // decide/target prompts).

@@ -169,7 +169,7 @@ impl fmt::Display for GameView {
         }
 
         // ── Your Star Chart ───────────────────────────────────────────────────
-        let my_complete = self.my_star_chart.complete_systems().len();
+        let my_complete = self.my_star_chart.complete_count();
         writeln!(f, "\nYOUR STAR CHART ({}/3 complete systems):", my_complete)?;
         if self.my_star_chart.systems.is_empty() {
             writeln!(f, "  (no systems placed yet)")?;
@@ -179,8 +179,8 @@ impl fmt::Display for GameView {
                 let status = if complete { "COMPLETE" } else {
                     &format!("needs {} more discovery/ies", sys.class as usize - sys.discoveries.len())
                 };
-                let eclipse = if sys.eclipse_id.is_some() { " [Solar Eclipse — PROTECTED]" } else { "" };
-                writeln!(f, "  • {} [class {}] {}/{} slots filled — {}{}",
+                let eclipse = if sys.eclipse_id.is_some() { " [Solar Eclipse - PROTECTED]" } else { "" };
+                writeln!(f, "  • {} [class {}] {}/{} slots filled - {}{}",
                     sys.star_name, sys.class, sys.discoveries.len(), sys.class, status, eclipse)?;
                 for disc in &sys.discoveries {
                     let pol = if disc.planet_of_life_id.is_some() { " [Planet of Life attached]" } else { "" };
@@ -194,7 +194,7 @@ impl fmt::Display for GameView {
 
         // ── Opponents ─────────────────────────────────────────────────────────
         for opp in &self.opponents {
-            let opp_complete = opp.star_chart.complete_systems().len();
+            let opp_complete = opp.star_chart.complete_count();
             let danger = if opp_complete >= 2 { " ⚠ ONE SYSTEM AWAY FROM WINNING" } else { "" };
             writeln!(f, "\nOPPONENT: {} | Hand: {} cards | {}/3 complete systems{}",
                 opp.name, opp.hand_size, opp_complete, danger)?;
@@ -212,7 +212,7 @@ impl fmt::Display for GameView {
                 for sys in &opp.star_chart.systems {
                     let complete = sys.discoveries.len() >= sys.class as usize;
                     let eclipse = if sys.eclipse_id.is_some() { " [PROTECTED]" } else { "" };
-                    writeln!(f, "  • {} [class {}] {}/{} — {}{}",
+                    writeln!(f, "  • {} [class {}] {}/{} - {}{}",
                         sys.star_name, sys.class, sys.discoveries.len(), sys.class,
                         if complete { "COMPLETE" } else { "incomplete" }, eclipse)?;
                 }
@@ -240,10 +240,10 @@ pub trait Player: Send + Sync {
     fn name(&self) -> &str;
 
     /// Choose an action during the Action Phase.
-    /// `legal_actions` is a pre-validated list — the player must return one of them.
+    /// `legal_actions` is a pre-validated list - the player must return one of them.
     fn choose_action(&self, view: &GameView, legal_actions: &[Action]) -> usize;
 
-    /// Full-state variant of choose_action — receives the complete GameState so
+    /// Full-state variant of choose_action - receives the complete GameState so
     /// MCTS players can run simulations. Defaults to choose_action for all others.
     fn choose_action_with_state(&self, view: &GameView, _state: &GameState, legal: &[Action]) -> usize {
         self.choose_action(view, legal)
@@ -258,11 +258,11 @@ pub trait Player: Send + Sync {
         legal_responses: &[ChainAction],
     ) -> Option<usize>;
 
-    /// Full-state variant of respond_to_chain — receives the complete
+    /// Full-state variant of respond_to_chain - receives the complete
     /// GameState AND the real Chain (not just its summary view) so search
     /// players can simulate resolving each candidate response. `cursor` is
     /// the engine's true position in the round-robin response window at
-    /// this decision point — pass it straight through to
+    /// this decision point - pass it straight through to
     /// `GameEngine::simulate_finish_chain` to resume look-ahead search with
     /// the exact continuation semantics the real game would use. Defaults to
     /// respond_to_chain for all others.
@@ -281,7 +281,7 @@ pub trait Player: Send + Sync {
     /// Pick one option from a numbered list of choices (mid-effect decision point).
     fn decide(&self, view: &GameView, request: &ChoiceRequest) -> usize;
 
-    /// Full-state variant of decide — infrastructure only (see
+    /// Full-state variant of decide - infrastructure only (see
     /// `choose_action_with_state`'s doc for the pattern this mirrors): no
     /// search player currently overrides this, it exists so future work can
     /// without touching the trait again. Defaults to `decide` for everyone.

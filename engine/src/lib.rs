@@ -8,4 +8,5 @@ pub mod human;
 pub mod ollama;
 pub mod player;
 pub mod protocol;
+pub mod random;
 pub mod star_chart;

@@ -94,7 +94,7 @@ fn score_action(action: &Action, view: &GameView) -> i32 {
     match action {
         Action::Pass => 0,
 
-        // Instant win — always take it
+        // Instant win - always take it
         Action::PlaySupernovas { .. } => 1_000_000,
 
         // Play star + discoveries as a set
@@ -122,7 +122,7 @@ fn score_action(action: &Action, view: &GameView) -> i32 {
             match &card.kind {
                 // Supernovas are only useful as a trio via PlaySupernovas
                 CardKind::Flare(n) if n.is_supernova() => -100,
-                // CosmicDenial is a reactive card — wasteful to proactively play
+                // CosmicDenial is a reactive card - wasteful to proactively play
                 CardKind::Flare(FlareName::CosmicDenial) => 15,
                 CardKind::Flare(FlareName::StellarAlignment) => 115,
                 CardKind::Flare(FlareName::Wormhole) => 105,
@@ -175,7 +175,7 @@ fn score_discovery(onto_star: CardId, view: &GameView, my_complete: usize) -> i3
     let needed = sys.class as usize;
 
     if after >= needed {
-        // Completes the system — weight by how close we are to winning
+        // Completes the system - weight by how close we are to winning
         match my_complete {
             2 => 1600, // this wins the game
             1 => 750,
@@ -229,7 +229,7 @@ fn score_chain_response(resp: &ChainAction, view: &GameView, chain: &ChainView) 
 
     match &card.kind {
         CardKind::Flare(FlareName::CosmicDenial) => {
-            // Only count opponent links as threats — never negate own cards
+            // Only count opponent links as threats - never negate own cards
             let my_tag = format!("Player {}", view.my_idx);
             let opponent_link = |l: &crate::chain::ChainLinkView| !l.negated && l.player_name != my_tag;
 
@@ -344,7 +344,7 @@ fn best_class_to_block(opts: &[String], view: &GameView) -> usize {
 }
 
 fn best_nursery_pick(opts: &[String]) -> usize {
-    // Bury supernovas — send them to the bottom so opponents can't Shockwave into them
+    // Bury supernovas - send them to the bottom so opponents can't Shockwave into them
     for (i, opt) in opts.iter().enumerate() {
         if opt.to_lowercase().contains("supernova") {
             return i;
@@ -400,7 +400,7 @@ fn card_keep_value(card: &Card, view: &GameView) -> i32 {
     let my_complete = view.my_star_chart.complete_systems().len();
 
     match &card.kind {
-        // Never discard supernovas — they're part of an instant-win combo
+        // Never discard supernovas - they're part of an instant-win combo
         CardKind::Flare(n) if n.is_supernova() => 1000,
 
         CardKind::Fracture(FractureName::Shockwave) => match supernovas {
@@ -902,7 +902,7 @@ fn adv_decision(view: &GameView, request: &ChoiceRequest, player_name: &str) -> 
 }
 
 fn adv_wormhole_mode(view: &GameView) -> usize {
-    // Mode 1 (steal from star chart) is almost always better — we pick what to take
+    // Mode 1 (steal from star chart) is almost always better - we pick what to take
     let chart_stealable = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter()
             .any(|s| !s.is_eclipse_protected() && !s.discoveries.is_empty())
@@ -911,7 +911,7 @@ fn adv_wormhole_mode(view: &GameView) -> usize {
 }
 
 fn adv_ignition_mode(view: &GameView) -> usize {
-    // Mode 0: destroy Gas Giant from star chart (better — destroys it)
+    // Mode 0: destroy Gas Giant from star chart (better - destroys it)
     let gas_in_chart = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter().any(|s| s.has_gas_giant() && !s.is_eclipse_protected())
     });
@@ -919,8 +919,8 @@ fn adv_ignition_mode(view: &GameView) -> usize {
 }
 
 fn adv_athena_mode(view: &GameView) -> usize {
-    // Mode 0: destroy any Discovery (default — more flexible)
-    // Mode 1: return Gas Giant to hand — only if taking it breaks a complete system
+    // Mode 0: destroy any Discovery (default - more flexible)
+    // Mode 1: return Gas Giant to hand - only if taking it breaks a complete system
     let breaks_complete = view.opponents.iter().any(|o| {
         o.star_chart.systems.iter()
             .any(|s| s.has_gas_giant() && !s.is_eclipse_protected() && s.is_complete())
@@ -983,7 +983,7 @@ fn adv_worst_card_idx(view: &GameView) -> usize {
 
 fn adv_nursery_pick(opts: &[String], view: &GameView) -> usize {
     let supernovas = view.my_hand.iter().filter(|c| c.is_supernova()).count();
-    // Bury supernovas to deny Shockwave access — unless we already have 2 (then keep near top)
+    // Bury supernovas to deny Shockwave access - unless we already have 2 (then keep near top)
     if supernovas < 2 {
         if let Some(i) = opts.iter().position(|o| o.to_lowercase().contains("supernova")) {
             return i;

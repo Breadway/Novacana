@@ -1,0 +1,46 @@
+Fidelity test: 200 games × 4 players, model=learning_curve_out/pretrain_8000.bin
+
+--- choose_action ---
+  overall                 agree= 97.4%  top2= 99.8%  agree_mass=0.942(CE=0.06)  miss_mass=0.285(CE=1.26)  mean_CE=0.09  in_mask=100.0%  legal_avg=4.5  n=6000
+  turns  1–5              agree= 98.2%  top2=100.0%  agree_mass=0.944(CE=0.06)  miss_mass=0.392(CE=0.94)  mean_CE=0.07  in_mask=100.0%  legal_avg=4.6  n=450
+  turns  6–15             agree= 98.6%  top2=100.0%  agree_mass=0.946(CE=0.06)  miss_mass=0.364(CE=1.01)  mean_CE=0.07  in_mask=100.0%  legal_avg=4.5  n=838
+  turns 16–30             agree= 97.1%  top2= 99.8%  agree_mass=0.942(CE=0.06)  miss_mass=0.279(CE=1.28)  mean_CE=0.10  in_mask=100.0%  legal_avg=4.5  n=1122
+  turns 31+               agree= 97.1%  top2= 99.8%  agree_mass=0.941(CE=0.06)  miss_mass=0.269(CE=1.31)  mean_CE=0.10  in_mask=100.0%  legal_avg=4.5  n=3590
+  -- misses by legal-set size (difficulty curve) --
+    legal=1  agree=100.0%  top2=100.0%  miss_mass=0.000  in_mask=100.0%  n=113
+    legal=2  agree= 99.7%  top2=100.0%  miss_mass=0.326  in_mask=100.0%  n=398
+    legal=3  agree= 98.7%  top2=100.0%  miss_mass=0.298  in_mask=100.0%  n=934
+    legal=4  agree= 97.6%  top2=100.0%  miss_mass=0.292  in_mask=100.0%  n=1479
+    legal=5  agree= 96.9%  top2= 99.9%  miss_mass=0.291  in_mask=100.0%  n=1571
+    legal=6  agree= 96.1%  top2= 99.6%  miss_mass=0.253  in_mask=100.0%  n=1033
+    legal=7  agree= 95.8%  top2= 99.5%  miss_mass=0.331  in_mask=100.0%  n=382
+    legal=8  agree= 93.6%  top2= 98.7%  miss_mass=0.196  in_mask=100.0%  n=78
+    legal=9+  agree= 91.7%  top2=100.0%  miss_mass=0.467  in_mask=100.0%  n=12
+
+  -- 20 sample choose_action disagreements (ml_abs / advcpu_abs / mass / legal_sz / in_mask) --
+    turn= 46  ml=22 adv=21  mass=0.003  legal=6  in_mask=true  [low-mass miss]
+    turn= 67  ml= 5 adv=18  mass=0.011  legal=7  in_mask=true  [low-mass miss]
+    turn= 49  ml=30 adv=17  mass=0.013  legal=4  in_mask=true  [low-mass miss]
+    turn= 31  ml=16 adv= 1  mass=0.015  legal=3  in_mask=true  [low-mass miss]
+    turn= 91  ml= 5 adv=23  mass=0.015  legal=5  in_mask=true  [low-mass miss]
+    turn=149  ml=18 adv=17  mass=0.018  legal=4  in_mask=true  [low-mass miss]
+    turn=144  ml=28 adv=27  mass=0.026  legal=5  in_mask=true  [low-mass miss]
+    turn= 48  ml=14 adv=18  mass=0.029  legal=6  in_mask=true  [low-mass miss]
+    turn= 74  ml=14 adv=17  mass=0.038  legal=6  in_mask=true  [low-mass miss]
+    turn= 63  ml=22 adv=24  mass=0.038  legal=3  in_mask=true  [low-mass miss]
+    turn=  9  ml=17 adv= 1  mass=0.484  legal=4  in_mask=true  [high-mass miss]
+    turn= 28  ml=18 adv=14  mass=0.481  legal=5  in_mask=true  [high-mass miss]
+    turn= 89  ml=26 adv= 7  mass=0.480  legal=6  in_mask=true  [high-mass miss]
+    turn=  0  ml=13 adv=12  mass=0.478  legal=7  in_mask=true  [high-mass miss]
+    turn= 33  ml=26 adv=22  mass=0.478  legal=4  in_mask=true  [high-mass miss]
+    turn= 16  ml=26 adv= 7  mass=0.475  legal=5  in_mask=true  [high-mass miss]
+    turn= 11  ml= 5 adv= 6  mass=0.473  legal=4  in_mask=true  [high-mass miss]
+    turn=  8  ml=16 adv=28  mass=0.467  legal=10  in_mask=true  [high-mass miss]
+    turn= 41  ml=13 adv=12  mass=0.467  legal=6  in_mask=true  [high-mass miss]
+    turn= 25  ml= 5 adv= 6  mass=0.466  legal=3  in_mask=true  [high-mass miss]
+
+--- respond_to_chain ---
+  overall                 agree= 96.8%  top2= 99.9%  agree_mass=0.958(CE=0.04)  miss_mass=0.301(CE=1.20)  mean_CE=0.08  in_mask=100.0%  legal_avg=2.5  n=7736
+
+Diagnostic thresholds: top2 ~85%+ = difficulty (#1); top2 barely above agree = bug (#2/#3)
+  miss_mass near zero = structured wrong picks; miss_mass 0.2-0.35 = appropriate uncertainty

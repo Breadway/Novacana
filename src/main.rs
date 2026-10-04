@@ -109,7 +109,7 @@ impl CliPlayer {
                     }
                 }
             }
-            println!("  (invalid — try again)");
+            println!("  (invalid - try again)");
         }
     }
 }
@@ -134,7 +134,7 @@ impl Player for CliPlayer {
         println!("\n── CHAIN IS OPEN ──");
         println!("{}", chain);
         if legal_responses.is_empty() {
-            println!("  (no legal responses — you pass)");
+            println!("  (no legal responses - you pass)");
             return None;
         }
         println!("  Your hand has {} card(s).", view.my_hand.len());
@@ -255,7 +255,7 @@ fn describe_action(action: &Action, view: &GameView, _idx: usize) -> String {
             )
         }
 
-        Action::PlaySupernovas { .. } => "⚠ PLAY ALL 3 SUPERNOVAS — Cosmic Cataclysm!".into(),
+        Action::PlaySupernovas { .. } => "⚠ PLAY ALL 3 SUPERNOVAS - Cosmic Cataclysm!".into(),
 
         Action::PlayProtostar { card, choice } => match choice {
             novacana_engine::player::ProtostarChoice::DrawTwo => {
@@ -357,7 +357,7 @@ fn main() {
                     Box::new(EasyCpuPlayer::new("Learner-C")),
                 ]
             } else {
-                // "play" — Advanced CPU opponents
+                // "play" - Advanced CPU opponents
                 vec![
                     Box::new(AdvancedCpuPlayer::new("Alpha")),
                     Box::new(AdvancedCpuPlayer::new("Beta")),

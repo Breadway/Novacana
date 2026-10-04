@@ -39,17 +39,17 @@ Playing a Star starts a new system. Play Discoveries one at a time onto an incom
 A complete system counts toward the 3-system win.
 
 STARS (Class → Discoveries needed to complete):
-  Brown Dwarf   class 2 — needs 2 discoveries  [3 copies in deck]
-  Red Dwarf     class 2 — needs 2 discoveries  [4 copies]
-  White Dwarf   class 3 — needs 3 discoveries  [3 copies]
-  Yellow Dwarf  class 4 — needs 4 discoveries  [3 copies]
-  Red Giant     class 5 — needs 5 discoveries  [3 copies]
-  Red Supergiant class 6 — needs 6 discoveries  [2 copies]
-  Protostar     (special — see below)           [3 copies]
+  Brown Dwarf   class 2 - needs 2 discoveries  [3 copies in deck]
+  Red Dwarf     class 2 - needs 2 discoveries  [4 copies]
+  White Dwarf   class 3 - needs 3 discoveries  [3 copies]
+  Yellow Dwarf  class 4 - needs 4 discoveries  [3 copies]
+  Red Giant     class 5 - needs 5 discoveries  [3 copies]
+  Red Supergiant class 6 - needs 6 discoveries  [2 copies]
+  Protostar     (special - see below)           [3 copies]
 
 DISCOVERIES (fill one slot each when attached to a Star):
-  Rocky Planet   ×7 — can host Planet of Life Omen
-  Gas Giant      ×5 — can be targeted by Ignition and Wormhole specifically
+  Rocky Planet   ×7 - can host Planet of Life Omen
+  Gas Giant      ×5 - can be targeted by Ignition and Wormhole specifically
   Asteroid Belt  ×5
   Dwarf Planet   ×5
   Comet          ×5
@@ -59,7 +59,7 @@ Total discoveries: 27
 When a Flare, Fracture, or Omen is played it 'enters the Chain'.
 After the active player plays one, opponents may respond with their own chainable cards.
 The chain closes when all players pass consecutively. It then RESOLVES IN REVERSE ORDER
-(last card played resolves first — LIFO).
+(last card played resolves first - LIFO).
 Cosmic Denial can negate any Flare or Fracture currently in the chain.
 
 ━━━ ALL CARD EFFECTS ━━━
@@ -107,7 +107,7 @@ Black Hole [×2]
 Pulsar [×2]
   Shuffle YOUR OWN hand AND Star Chart cards into the Main Deck.
   Then draw up to 7 cards. Omen cards remain in play.
-  (Unlike Black Hole, only you are affected — useful to reset a bad hand.)
+  (Unlike Black Hole, only you are affected - useful to reset a bad hand.)
 
 Athena [×3]
   Choose one:
@@ -155,16 +155,16 @@ Protostar [×3]
 
 ━━━ STRATEGY GUIDE ━━━
 • Build cheap systems first: Red Dwarf/Brown Dwarf (class 2, needs only 2 discoveries).
-• White Dwarf (class 3) is also fast — use Protostar option B to place one for free.
+• White Dwarf (class 3) is also fast - use Protostar option B to place one for free.
 • Collect all 3 Supernovas via Shockwave for the instant-win Cosmic Cataclysm path.
 • Use Cosmic Denial to stop Black Hole (which wipes everyone's boards) or Pulsar.
-• Solar Eclipse on a complete system makes it near-invincible — prioritise it late game.
+• Solar Eclipse on a complete system makes it near-invincible - prioritise it late game.
 • Dark Matter Void on class 2 slows opponents who are rushing cheap stars.
-• Astral Projection reveals a hand for 2 turns — combine with Wormhole to steal a
+• Astral Projection reveals a hand for 2 turns - combine with Wormhole to steal a
   specific card from the revealed hand.
 • Athena destroys Discoveries mid-system, setting opponents back significantly.
-• Black Hole resets the whole board — use when you're behind, not ahead.
-• Pulsar resets YOUR board only — use it to trade a bad hand/board for a fresh 7.
+• Black Hole resets the whole board - use when you're behind, not ahead.
+• Pulsar resets YOUR board only - use it to trade a bad hand/board for a fresh 7.
 
 ━━━ CARD LOOKUP ━━━
 If you need the exact effect text of any card, respond ONLY with:
@@ -184,7 +184,7 @@ pub struct OllamaPlayer {
     pub base_url: String,
     /// When true, suppresses all eprintln! debug output (use in TUI observer mode).
     pub silent: bool,
-    /// HTTP agent with extended timeouts — large models can take several minutes.
+    /// HTTP agent with extended timeouts - large models can take several minutes.
     agent: ureq::Agent,
     /// Persistent conversation history. The system prompt is sent once via the
     /// `system` field; this vec holds the alternating user/assistant messages that
@@ -249,7 +249,7 @@ impl OllamaPlayer {
                     if answer.is_empty() { "1".to_string() } else { answer },
                 );
             }
-            // Truncated: <think> with no closing tag — model ran out of token budget.
+            // Truncated: <think> with no closing tag - model ran out of token budget.
             // Capture the partial thought; there is no answer to parse.
             let thought = text[open + 7..].trim().to_string();
             return (
@@ -280,7 +280,7 @@ impl OllamaPlayer {
         self.chat_with_history(user_content.clone(), user_content, 4096)
     }
 
-    /// Stateless single-shot call — no history read or write. Used for cheap yes/no questions.
+    /// Stateless single-shot call - no history read or write. Used for cheap yes/no questions.
     fn quick_ask(&self, prompt: &str, num_predict: u32) -> String {
         let body = serde_json::json!({
             "model": self.model,
@@ -424,10 +424,10 @@ impl OllamaPlayer {
             if let Some(card_name) = answer.strip_prefix("LOOKUP:") {
                 let card_name = card_name.trim();
                 let info = card_db::lookup_text(card_name)
-                    .unwrap_or_else(|| format!("'{}' not found — check spelling.", card_name));
+                    .unwrap_or_else(|| format!("'{}' not found - check spelling.", card_name));
                 self.log(&format!("LOOKUP({}) → {}", card_name, info));
                 let follow_up = format!(
-                    "[Card lookup: {}]\n\nNow choose — reply with ONLY the number (1–{}):",
+                    "[Card lookup: {}]\n\nNow choose - reply with ONLY the number (1–{}):",
                     info, options.len()
                 );
                 raw = self.chat(follow_up);
@@ -480,7 +480,7 @@ impl Player for OllamaPlayer {
             return None;
         }
 
-        // Step 1: cheap yes/no — does the player even want to respond?
+        // Step 1: cheap yes/no - does the player even want to respond?
         let card_names: Vec<String> = legal_responses
             .iter()
             .filter_map(|r| view.my_hand.iter().find(|c| c.id == r.card))
@@ -499,7 +499,7 @@ impl Player for OllamaPlayer {
 
         // Step 2: full context pick of which card to play.
         let ctx = format!(
-            "{}\nTHE OPEN CHAIN (resolves LIFO — last played resolves first):\n{}",
+            "{}\nTHE OPEN CHAIN (resolves LIFO - last played resolves first):\n{}",
             Self::game_context(view), chain
         );
         let mut opts: Vec<String> = legal_responses
@@ -579,12 +579,12 @@ fn describe_action(action: &Action, view: &GameView) -> String {
     };
 
     match action {
-        Action::Pass => "Pass — end your action phase".into(),
+        Action::Pass => "Pass - end your action phase".into(),
 
         Action::PlayStar(id) => {
             let class = view.my_hand.iter().find(|c| c.id == *id)
                 .and_then(|c| c.star_class())
-                .map(|cl| format!(" (class {} — needs {} more discoveries to complete)", cl, cl))
+                .map(|cl| format!(" (class {} - needs {} more discoveries to complete)", cl, cl))
                 .unwrap_or_default();
             format!("Place {} in Star Chart{}", card_name(*id), class)
         }
@@ -598,9 +598,9 @@ fn describe_action(action: &Action, view: &GameView) -> String {
             format!("Attach {} onto {} system", card_name(*card), sys_desc)
         }
 
-        Action::PlayFlare(id) => format!("Play {} [Flare] — enters Chain", card_name(*id)),
+        Action::PlayFlare(id) => format!("Play {} [Flare] - enters Chain", card_name(*id)),
 
-        Action::PlayFracture(id) => format!("Play {} [Fracture] — enters Chain", card_name(*id)),
+        Action::PlayFracture(id) => format!("Play {} [Fracture] - enters Chain", card_name(*id)),
 
         Action::PlayOmen { card, attachment } => {
             let where_ = match attachment {
@@ -616,7 +616,7 @@ fn describe_action(action: &Action, view: &GameView) -> String {
 
         Action::PlaySolarSystem { star, discoveries } => {
             let discs: Vec<String> = discoveries.iter().map(|&id| card_name(id)).collect();
-            let complete = view.my_star_chart.complete_systems().len() + 1;
+            let complete = view.my_star_chart.complete_count() + 1;
             format!(
                 "COMPLETE SYSTEM: {} + [{}] → {}/3 complete (need 3 to win!)",
                 card_name(*star), discs.join(", "), complete
@@ -624,7 +624,7 @@ fn describe_action(action: &Action, view: &GameView) -> String {
         }
 
         Action::PlaySupernovas { .. } => {
-            "*** WIN: Play all 3 Supernovas → COSMIC CATACLYSM — you win immediately! ***".into()
+            "*** WIN: Play all 3 Supernovas → COSMIC CATACLYSM - you win immediately! ***".into()
         }
 
         Action::PlayProtostar { card, choice } => match choice {
