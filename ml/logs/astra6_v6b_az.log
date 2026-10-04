@@ -1,7 +1,0 @@
-AlphaZero: 40 iters × 200 games × 100sims × 1 epochs  lr=0.00003  c_puct=1.5  window=200000
-Iter    1  new= 38821  buf=  38821  pl=+5.2533  vl=0.1968  pool=0  (531.1s)
-Iter    2  new= 40255  buf=  79076  pl=+1.9082  vl=0.2054  pool=0  (555.4s)
-Iter    3  new= 45895  buf= 124971  pl=+1.1259  vl=0.1923  pool=0  (569.3s)
-Iter    4  new= 50717  buf= 175688  pl=+1.0964  vl=0.1877  pool=0  (598.4s)
-Iter    5  new= 53628  buf= 200000  pl=+1.1281  vl=0.1861  pool=0  (621.7s)
-  Eval @ iter 5: 27.3%  (600 games)  *best

@@ -1,11 +1,17 @@
-/target/
+target/
 /data/
 /games/
-/logs/
+logs/
 /models/
 src.zip
+/src.tar.xz
+/novacana.zip
+/brothers-pc/novacana-source.tar.xz
+/ml/learning_curve_out/
 *.bin
 *.bin.bak
+__pycache__/
+*.py[cod]
 .idea/
 .claude/
 
