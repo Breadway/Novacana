@@ -756,6 +756,9 @@ struct ChooseSnap {
     pass_logit: f32,
     best_other_logit: f32,
     best_other: u8,
+    /// Softmax probability of Pass over the legal actions. This is the rate
+    /// a temperature-1 sample would pass, independent of the greedy pick.
+    pass_p: f32,
     value: f32,
 }
 
@@ -770,6 +773,7 @@ struct BehaviorLog {
     chain_n: usize,
     chain_pass: usize,
     chain_margins: Vec<f32>,
+    chain_pass_p: Vec<f32>,
     decide_n: usize,
     target_n: usize,
     discard_n: usize,
@@ -788,6 +792,7 @@ impl Default for BehaviorLog {
             chain_n: 0,
             chain_pass: 0,
             chain_margins: Vec::new(),
+            chain_pass_p: Vec::new(),
             decide_n: 0,
             target_n: 0,
             discard_n: 0,
@@ -825,16 +830,40 @@ fn choose_snap(tokens: &[tokens::Token], masked: &[f32], idx: usize, turn: u32, 
             best_other = k;
         }
     }
+    let n = tokens.len();
+    let pass_i = tokens.iter().position(|t| t.fields[0] == tokens::ActionKind::Pass as u8);
     ChooseSnap {
         turn,
         hand,
-        n_legal: tokens.len(),
+        n_legal: n,
         chosen: tokens[idx].fields[0],
         pass_logit,
         best_other_logit,
         best_other,
+        pass_p: softmax_prob(masked, n, pass_i),
         value,
     }
+}
+
+/// Softmax probability of `idx` over the first `n` logits. `None` is zero.
+fn softmax_prob(masked: &[f32], n: usize, idx: Option<usize>) -> f32 {
+    if n == 0 {
+        return f32::NAN;
+    }
+    let m = masked[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if !m.is_finite() {
+        return f32::NAN;
+    }
+    let mut sum = 0.0f32;
+    let mut hit = 0.0f32;
+    for (i, v) in masked[..n].iter().enumerate() {
+        let e = (v - m).exp();
+        sum += e;
+        if Some(i) == idx {
+            hit += e;
+        }
+    }
+    if sum == 0.0 { f32::NAN } else { hit / sum }
 }
 
 impl<B: Backend> BehaviorProbe<B>
@@ -883,12 +912,13 @@ where
         let idx = sampling::argmax(&masked[..n]);
         let mut g = self.log.lock().unwrap();
         g.chain_n += 1;
+        if n > 1 {
+            let best_other = masked[1..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            g.chain_margins.push(masked[0] - best_other);
+            g.chain_pass_p.push(softmax_prob(&masked, n, Some(0)));
+        }
         if idx == 0 {
             g.chain_pass += 1;
-            if n > 1 {
-                let best_other = masked[1..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                g.chain_margins.push(masked[0] - best_other);
-            }
             None
         } else {
             Some(idx - 1)
@@ -957,7 +987,39 @@ fn print_behavior(log: &BehaviorLog) {
         .iter()
         .filter(|s| s.chosen == tokens::ActionKind::Pass as u8 && s.n_legal > 1 && s.best_other_logit.is_finite())
         .collect();
-    println!("choose_action: {n} decisions, pass {passes}, of which {forced} had no other legal play");
+    println!("choose_action: {n} decisions, greedy pass {passes}, of which {forced} had no other legal play");
+    let contested: Vec<&ChooseSnap> = log
+        .chooses
+        .iter()
+        .filter(|s| s.n_legal > 1 && s.pass_logit.is_finite() && s.best_other_logit.is_finite())
+        .collect();
+    if !contested.is_empty() {
+        let greedy_pass = contested.iter().filter(|s| s.chosen == tokens::ActionKind::Pass as u8).count();
+        let mean_p = contested.iter().map(|s| s.pass_p).sum::<f32>() / contested.len() as f32;
+        let mut ps: Vec<f32> = contested.iter().map(|s| s.pass_p).collect();
+        ps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mean_pass = contested.iter().map(|s| s.pass_logit).sum::<f32>() / contested.len() as f32;
+        let mean_other = contested.iter().map(|s| s.best_other_logit).sum::<f32>() / contested.len() as f32;
+        println!(
+            "  contested: {}  greedy pass {}/{} ({:.1}%)",
+            contested.len(),
+            greedy_pass,
+            contested.len(),
+            100.0 * greedy_pass as f32 / contested.len() as f32
+        );
+        println!(
+            "  softmax P(pass) at temperature 1: mean {:.3}  p50 {:.3}  p90 {:.3}",
+            mean_p,
+            percentile(&ps, 0.5),
+            percentile(&ps, 0.9)
+        );
+        println!(
+            "  logits on every contested decision: pass {:.3}  best other {:.3}  margin {:.3}",
+            mean_pass,
+            mean_other,
+            mean_pass - mean_other
+        );
+    }
     if !voluntary.is_empty() {
         let mut margins: Vec<f32> = voluntary.iter().map(|s| s.pass_logit - s.best_other_logit).collect();
         margins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1019,9 +1081,16 @@ fn print_behavior(log: &BehaviorLog) {
     );
     if !log.chain_margins.is_empty() {
         let mean = log.chain_margins.iter().sum::<f32>() / log.chain_margins.len() as f32;
+        let mean_p = if log.chain_pass_p.is_empty() {
+            f32::NAN
+        } else {
+            log.chain_pass_p.iter().sum::<f32>() / log.chain_pass_p.len() as f32
+        };
         println!(
-            "  chain pass margin, pass logit minus best card: mean {mean:.2} over {} passes with a card legal",
-            log.chain_margins.len()
+            "  chain with a card legal: {}  greedy pass margin mean {:.3}  softmax P(pass) mean {:.3}",
+            log.chain_margins.len(),
+            mean,
+            mean_p
         );
     }
     if !log.openings.is_empty() {
@@ -1029,12 +1098,13 @@ fn print_behavior(log: &BehaviorLog) {
         for s in &log.openings {
             let margin = if s.best_other_logit.is_finite() { s.pass_logit - s.best_other_logit } else { f32::NAN };
             println!(
-                "  turn {:<4} hand {:<2} legal {:<3} {:<16} margin {:>7.3}  pass {:.3}  best {} {:.3}  value {:.3}",
+                "  turn {:<4} hand {:<2} legal {:<3} {:<16} margin {:>7.3}  P(pass) {:.3}  pass {:.3}  best {} {:.3}  value {:.3}",
                 s.turn,
                 s.hand,
                 s.n_legal,
                 tokens::action_kind_name(s.chosen),
                 margin,
+                s.pass_p,
                 s.pass_logit,
                 tokens::action_kind_name(s.best_other),
                 s.best_other_logit,

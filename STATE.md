@@ -1,8 +1,254 @@
 # Astra-7 - Current State
 
-Snapshot as of 2026-07-10, repo relocated 2026-07-15, optimization pass
-2026-07-16. Full design/history in `ASTRA7.md`; this is the training-
-pipeline-focused status doc.
+Snapshot as of 2026-10-04. The July 2026 pod campaign (below) is history:
+its checkpoints died with the pod. Full design in `ASTRA7.md`; the
+implemented net is `docs/ASTRA7-NET.md`. This file is the training status.
+
+## Current campaign - Hestia, 2026-10-04
+
+Training is on Hestia (Ubuntu 24.04, `ssh -o HostName=192.168.1.102 hestia`,
+`~/Projects/novacana`), not on the rented 4090 and not on the brother's
+3080. The GPU is an Intel Arc A380. Usable VRAM is 6144 MiB. Burn reaches
+it with `--features vulkan` (`burn-wgpu`, SPIR-V). `vulkan_device()`
+defaults to `DiscreteGpu(0)`. There is no CUDA device. Do not
+cross-compile the binary on Hermes: its glibc is newer than Ubuntu 24.04.
+Release builds on Hestia set `CARGO_BUILD_JOBS=3`,
+`CARGO_PROFILE_RELEASE_LTO=false`, and
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`. The workspace profile is thin
+LTO and `codegen-units = 1`, which is too heavy beside the other services
+on that box.
+
+The live run is fp32 (`Wgpu<f32, i32>`), resumed the evening of 2026-10-04
+from the fp16 weights. It is epoch 2 of 15, restarted on fresh games.
+`models/astra7_bc.resume.txt` at the batch-1500 checkpoint read
+`epoch=1` (0-indexed), `global_step=36455`, `best_acc=0.43911305`. At the
+last check the process was alive at batch 1750/20789, about 1.19 s/batch,
+learning rate 2.95e-4. The cumulative policy mean was 1.06 and the
+cumulative value mean was 0.24. One epoch at this pace is about 7 hours.
+The pre-switch weights are `models/astra7_bc_fp16.bin` (stopped at epoch 2,
+batch 13403/19606, `global_step=34955`). A copy of the batch-1200 fp32
+checkpoint is on Hermes at `models/astra7_bc_fp32_early.bin`. Checkpoints
+are `BinFileRecorder<FullPrecisionSettings>`, 19,952,515 bytes, fp32 on
+disk even when the net that wrote them was fp16. Adam moments are not
+stored. Every resume, including this precision switch, rebuilds Adam from
+step 1 and keeps the weights, the learning-rate step, and `best_acc`.
+SIGTERM finishes the current step and writes the checkpoint plus
+`astra7_bc.resume.txt`. `--resume` and `--model` are mutually exclusive.
+Resume restarts that epoch index on fresh chunk games. Launch with
+`script -a` so the log is appended, not truncated.
+
+```
+cd ~/Projects/novacana && nice -n 5 script -a -q -f -c \
+  './target/release/novacana-ml7 bc --resume models/astra7_bc.bin \
+   --out models/astra7_bc.bin --batch-size 64 --chunk-games 2000 \
+   --epochs 15 --gen-concurrency 8' logs/astra7-bc.log
+```
+
+Teacher is `ExpertCpuPlayer`, confirmed by timing: the fp32 resume built
+124,730 validation samples from 200 games in 7.3 s. The AdvCPU teacher
+this was switched away from finishes that set in a fraction of a second.
+Recipe around the net: label smoothing 0.05 over the legal set, value MSE
+weight 0.3 against the terminal win bit, Adam with grad-clip 1.0, lr
+3e-4 with a 5% warmup then cosine, val 200 games, win-rate eval 150 games
+every epoch, checkpoint every 300 batches. Batch 64 is the choice on this
+card. fp16 throughput was flat from batch 64 through 192, so a larger
+batch did not finish an epoch sooner and it cut the number of Adam steps.
+fp32 batch 128 runs out of memory. fp32 batch 64 fits.
+
+### Why the first Hestia run was fp16
+
+The Arc's fp16 path is about twice the fp32 path, and the card has 6 GB.
+A full-precision copy of the weights is only 19.0 MiB. The 2.4 GB the
+fp16 run held is activations. The original call was that the fp32 batch
+this model wants would not fit, and that fp16 would spend the same 6 GB
+on a faster step. Measured afterward: fp16 batch 64 was about 0.80 to
+0.83 s/batch (about 77 sequences/s, roughly 2.4 GB resident). fp32 batch
+64 is about 1.18 to 1.28 s/batch and does fit. Batch 128 fp32 does not.
+bf16 was not the fallback. Burn's WGSL compiler panics on bf16. The
+`vulkan` feature compiles through SPIR-V, which can emit bf16, but that
+still depends on Mesa advertising `VK_KHR_shader_bfloat16`. fp32 was the
+change that removed the fp16 optimizer floor without a new shader type.
+
+### fp16 numeric failures
+
+Three fp16 overflows showed up, and they are different bugs.
+
+1. **Illegal-logit fill became -inf, then NaN'd the legal logits.** The
+   mask is `illegal_flag * LOGIT_MASK`, added onto the logits. The fill
+   had been `-1e9`. fp16 cannot represent that (the largest finite value
+   is 65504), so the fill flushed to -inf. A legal slot multiplies the
+   fill by 0. `0 * -inf` is NaN, and that NaN replaced the legal logit
+   before the softmax. The constant is now `-1e4`
+   (`ml7/src/net.rs`, `LOGIT_MASK`). That value is a normal fp16 number,
+   and after softmax it is still effectively zero. It was kept when
+   training moved to fp32.
+2. **Adam's epsilon flushed, and the first step divided by zero.** Burn's
+   denominator is `sqrt(second_moment) + epsilon * sqrt(1 - beta2^t)`.
+   The default epsilon is `1e-5`. On step 1 the square-root factor is
+   about 0.0316, so the added term is about `3e-7`. fp16's smallest
+   normal value is about `6e-5`, so that term flushed to 0. With a cold
+   second moment also flushed, the denominator was 0 and the weights went
+   NaN. The first repaired run died this way by about batch 50. The log
+   is `logs/astra7-bc.nan-20261004.log`. That checkpoint was deleted.
+   The fp16 repair raised epsilon to `1e-2`, the smallest value whose
+   step-1 term (about `3e-4`) stays a normal fp16 number. Moments are
+   rebuilt on every resume, so the step-1 constraint applies again after
+   every SIGTERM, not only on a fresh net.
+3. **Layer-norm epsilon `1e-5` flushed the same way**, and the norm then
+   divided by zero. The fp16 Vulkan build used `1e-4`.
+
+The epsilon repair is what stalled the policy. After the first few dozen
+steps `sqrt(1 - beta2^t)` is 1, so `0.01` sits in the denominator for the
+rest of the run. Large early gradients still move the weights. Once a
+per-weight gradient falls below about 0.01, the update shrinks by about
+`lr / 0.01` relative to ordinary Adam, roughly 30x at lr `3e-4`. There is
+no loss scaling, and the global-norm clip of 1.0 would undo a loss scale
+anyway. The fp16 loss did the coarse part, from about 1.8 down to about
+1.22, and then sat there. Fresh expert games in epoch 2 were still at
+1.22 to 1.25. The July 4090 run, ordinary Adam, same step count in epoch
+1, reached 65.7% validation accuracy and a 14% win rate. This run's epoch
+1 was validation accuracy 0.4391, validation CE 1.2203, policy 1.2601,
+value 0.2535, and 0 wins in 150 games, in 16190.8 s. `best_acc` stayed
+0.4391.
+
+The value loss of about 0.25 is the "always say 0.5" floor on a 0/1
+label. Greedy play does not read the value head.
+
+### What the fp16 player did
+
+Greedy play, the same rule as `eval_win_rate`, turned a flat policy into
+a seat that never puts a card down. On the live mid-epoch-2 fp16
+checkpoint, Hermes saw 0 wins in 16 games and 757 voluntary passes out of
+758 `choose_action` decisions where a card was legal, including every
+opening hand. Mean logits were about 9.43 for Pass and 9.34 for the best
+other legal play (mean margin 0.093, max 0.226). The epoch-1 best
+checkpoint, `models/astra7_bc_best.bin`, was the same shape at lower
+logits (about 8.0, margin about 0.13): 0 wins in 8 games, passes only.
+The one spectator trace from that eval was 44 passes in 44 decisions.
+Chain responses were passes too. A seat that never places a card cannot
+finish a system, so the 0/150 win-rate read matches the trace. The
+softmax gap of 0.09 is not a peaked "always pass" distribution. Greedy
+play takes the higher logit every time, and Pass was always that logit.
+Validation accuracy does not catch it: 43.9% is measured on expert
+states, and the all-pass trajectory leaves those states on turn 1.
+
+### fp32, and the early eval
+
+Both Vulkan-only overrides are gone: Adam is back on the default
+epsilon `1e-5`, and layer norm is back on `1e-5`. The fp16 run was
+stopped with SIGTERM at batch 13403 so the new binary could take the
+GPU. The weights were kept.
+
+`novacana-ml7 behavior` plays the same greedy-versus-3x-AdvancedCpu games
+as `winrate` and records the logits. It now also records the temperature-1
+softmax probability of Pass on every contested decision, which is the rate
+a sample would pass. `winrate` stores only the win bit. The Hermes eval
+of `models/astra7_bc_fp32_early.bin` (the batch-1200 save, 8 games, CPU
+build, 10.9 s) was:
+
+- 0 wins in 8. Mean turns 219. Games that never played a card: 0/8.
+  Eight losses do not pin the rate at zero. A 14% player, which is where
+  the July run was after one epoch, loses all of 8 games about a third of
+  the time.
+- `choose_action`: 342 decisions. Greedy pass on 125 of 339 decisions
+  where a card was legal (36.9%). Three passes had no other legal move.
+- Softmax P(Pass) at temperature 1, over those 339: mean 0.281, median
+  0.243, 90th percentile 0.569.
+- Logits on every contested decision: Pass 2.832, best other card 3.076,
+  margin -0.244. The card is ahead on average. When greedy play did pass,
+  the margin was real (mean 0.636, median 0.586), not the old 0.09.
+- Cards actually chosen: Discovery 73, Star 64, Fracture 28, Flare 25,
+  Protostar (draw two) 22, Omen (planet of life) 2.
+- Openings: 6 of 8 played a card on turn 1. The two passes had margins
+  0.619 and 0.300.
+- Chain responses are still mostly passes: 283 of 301 greedy, mean
+  softmax P(Pass) 0.531, mean pass-minus-best-card margin +0.767.
+- Value head mean on the `choose_action` states: 0.000.
+
+So the stall moving was visible in play by batch 1200: the seat places
+cards, and it has not yet won. The cumulative policy mean at batch 1750
+was 1.06, under the fp16 floor of about 1.22, with single batches still
+bouncing (the batch-1750 sample was 1.36). The end of this epoch is the
+first scored read: validation accuracy against 0.4391, the new
+`diag@epoch` block, and the 150-game win rate.
+
+### Dashboard and the validation block
+
+Public page: `https://astra.breadway.dev`. On the LAN,
+`http://192.168.1.102:8420`. The process is
+`tools/dashboard_server.py` with `ASTRA7_LOCAL=1`, pid file
+`~/astra7-dashboard.pid`, log `~/astra7-dashboard.log`. Hestia's Caddy
+proxies `host.docker.internal:8420`. Aegis proxies the Tailscale address
+of that same port. The user approved the public hostname.
+
+The GPU panel used to call `nvidia-smi` and read "GPU unknown". It now
+reads the Arc through DRM fdinfo: render-engine time for utilization,
+resident VRAM against the 6144 MiB usable figure, and `energy1_input` for
+watts. There is no temperature sensor. `intel_gpu_top` aborts on this
+card (`get_num_gts`). Do not `pgrep -f` / `pkill -f` for `novacana-ml7`.
+The pattern matches the ssh command. Use `pgrep -x novacana-ml7` or the
+pid file. The BC pid file is `~/astra7-bc.pid` and holds the `script`
+wrapper pid.
+
+Epoch-end validation beyond the old top-1 line is `val_diag` in
+`ml7/src/net.rs`, printed as `diag@epochN: {json}` after the existing
+`Iter` line. The panel stays empty until that line exists. Epoch 1
+finished before the code was in the binary, so the first line will be the
+end of this fp32 epoch 2. The block is: policy top-1, top-3, top-5,
+teacher probability, teacher mean rank, teacher margin, normalized
+entropy; by decision, Play (including Pass), Chain, Decide, Target,
+Discard; value MSE, MAE, mean V, winner V, loser V, AUC; accuracy by
+legal-action count and by history length. Rank is 1-based and strict.
+Ties do not take a midrank. Entropy is `H(softmax over legal) / ln(n)`,
+0 when one action is legal. `best_acc` is still top-1. The longer Mission
+Control list (placement, win-rate interval, game length, a fixed hard-case
+set, ECE, gradient norms, throughput, VRAM high-water) is not built.
+`GameResult` has no finishing place.
+
+### Nets on disk
+
+`ASTRA7.md` §3 still describes a learned positional encoding, an auxiliary
+head, about 150 tokens, and 6 to 8 million parameters. The implemented
+net is the one in `docs/ASTRA7-NET.md`: bidirectional 6-layer pre-norm
+encoder, d_model 256, 8 heads, feed-forward 1024, dropout 0.1, no
+positional table, no causal mask, no decoder, no opponent-hand head.
+Sequence length 180 (52 state + 64 history + 64 action). Parameter count
+is 4,987,394. Layer norm and Adam on the Vulkan build are the defaults
+above (`1e-5`), not the fp16 overrides.
+
+Older checkpoints are five shapes, counted from the bincode `f32` vector
+lengths. v3 is the v2 net and v5 is the v4 net. The stubs say what the
+training changed. `Overview.md` §5's 24-float candidate table is the v4
+layout. `ml/src/candidate.rs` is the Astra-6 encoder. The live Astra-6
+trunk in `ml/src/net.rs` matches `docs/ASTRA6-WIDE.md`, not the v6
+roadmap in `Overview.md`.
+
+| Doc | Shape | Parameters | Checkpoints |
+|---|---|---|---|
+| `docs/ASTRA1.md` | 96 to 256 to 256 to 128 to {35, 1} | 128,164 | `models/net.bin`, `models/rl.bin` (512,736 bytes) |
+| `docs/ASTRA2.md` | 104 to 256 to 256 to 256 to 128 to {35, 1}, skips on the two 256 layers | 196,004 | `net_v2`, `net_v3`, `rl_v2`, `rl_v3` (784,112 bytes) |
+| `docs/ASTRA3.md` | same net as v2 | 196,004 | PPO, shaped rewards, snapshot pool. Recorded eval 43.8% over 500 games |
+| `docs/ASTRA4.md` | that trunk, plus candidate 152 to 32 to 1 | 200,933 | `net_v4`, `net_v5`, `rl_v4`, `rl_v5` (803,860 bytes) |
+| `docs/ASTRA5.md` | same net as v4 | 200,933 | candidate pretrain, GAE lambda 0.95, AdvancedCpu kept in the pool at 30%. `Overview.md` records no finished win rate |
+| `docs/ASTRA6.md` | 486 to 512 x4 to {31, 1}, candidate 536 to 32 to 1. No skip on the fourth 512 | 1,070,945 | `astra6_v3_rl.bin`, `pretrain_{1000,2000,4000,8000}.bin` (4,283,908 bytes) |
+| `docs/ASTRA6-WIDE.md` | same trunk, candidate 536 to 128 to 1 | 1,122,593 | the other `astra6_*.bin`, including `*_best` (4,490,500 bytes) |
+| `docs/ASTRA7-NET.md` | the encoder above | 4,987,394 | `ml7/models/astra7_bc_scaled.bin`, plus the live `models/astra7_bc.bin` |
+
+`ASTRA7.md` and `Overview.md` stay at the repo root. They are the design
+note and the project overview.
+
+### What this run is for
+
+The published BC gate is a greedy player against three AdvancedCpu seats,
+floor 25%, target 30 to 40%. ExpertCpu's own seat-0 rate against three
+AdvancedCpu is the ceiling of a perfect clone, documented below at about
+47% and re-measured once at about 40% under `max_turns(400)`. The July
+ExpertCpu clone plateaued at 23% and was stopped so TD-value could take
+the rest. Those checkpoints are gone with the pod. TD-value and the
+AlphaZero league are implemented and have not been restarted. They are
+the step after a Hestia checkpoint plays cards and the win-rate read
+leaves zero. The fp32 epoch-2 eval is the next measurement, not a reason
+to start TD on the batch-1200 weights.
 
 **OPTIMIZATION PASS (2026-07-16)** - consulted Fable 5 for engine/training
 optimizations given the pod→brother's-PC compute downgrade (13-14 vCPUs/
@@ -109,10 +355,13 @@ was moved too (`~/.claude/projects/-home-breadway-Projects-novacana`). If
 any doc/script below still references the old Nextcloud path, treat
 `~/Projects/novacana` as current.
 
-**CURRENT FOCUS (2026-07-15): brother's PC (RTX 3080 10GB, i7-10700K, 16GB
-RAM, Windows) as free training compute**, not the RunPod pod below - the pod
-work is paused (see "pod lost, budget break" below) until the user has
-budget to resume it.
+**SUPERSEDED 2026-10-04.** The brother's PC was the plan on 2026-07-15.
+Training since 2026-10 is the Hestia Arc run at the top of this file. The
+install bundle below is unused by the current run.
+
+**FOCUS ON 2026-07-15: brother's PC (RTX 3080 10GB, i7-10700K, 16GB
+RAM, Windows) as free training compute**, not the RunPod pod below. The pod
+work was paused (see "pod lost, budget break" below).
 
 **Install bundle DONE, in `brothers-pc/`** (repo root) - everything needed
 to stand the brother's PC up as a training node, ready to walk through
@@ -320,6 +569,9 @@ of the ssh.runpod.io proxy is the most likely fix, since that's what
 worked cleanly for the previous pod all night; or tar+ssh-cat instead of
 rsync; or check if RunPod exposes a non-proxied port for this pod) before
 the repo can be synced over and BC training restarted.
+
+**Not taken.** BC was restarted on Hestia in 2026-10 instead of on another
+rented 4090. The list is what a pod resume would still require.
 
 **Next steps on resume**: (1) solve the rsync-over-proxy problem or get a
 direct connection string, (2) rsync the repo to the new pod, (3) install
@@ -611,7 +863,7 @@ its own self-play data on the fly, no static corpus dependency.
   Deferred pending an isolated correctness test; not worth gambling on the
   live campaign.
 
-## Current training run - on the 4090, clean run in progress
+## Training run on the 4090 (2026-07-10, stopped; checkpoints lost with the pod)
 
 Migrated A4000 → 4090 (Opus 4.8's review: this stage is GPU-*compute*-bound,
 not the "VRAM problem, GPU tier doesn't matter" read ASTRA7.md §10
@@ -636,7 +888,7 @@ document/conversation history since the original logs are gone.
 | 7 | 4090, fully fresh (`Net::fresh()`, no `--model`), `--epochs 15`, current encoding fixes applied, AdvCPU teacher | Epoch 1: val_acc **94.73%**, policy loss 0.2485, win_rate 12.67% (n=150). Epoch 2: val_acc **95.52%**, policy loss 0.1496, win_rate 14.67% (n=150). Re-measured epoch 2's checkpoint at n=1000 for a trustworthy read: **19.60%** - essentially at the ~20% AdvCPU-equally-matched ceiling already (Fable 5's read: BC vs AdvCPU had converged, more epochs would buy ~nothing). Killed mid-epoch-3 to switch strategy per that consult. |
 | 8 | 4090, warm-started from run 7's checkpoint attempt, then **killed and restarted fully fresh** | User correctly pushed back on warm-starting through yet another encoding change - same reasoning as run 6. Restarted `Net::fresh()`. |
 | 9 | 4090, fresh start, **teacher switched to `ExpertCpuPlayer`** (bug #7 above), PlaySolarSystem hash-signature fix (bug #6) | **Looked normal, silently broken.** Compiled, ran, val-set generation reported 0.2-0.3s for 200 games - not questioned in the moment. Reached epoch 1-3 before a Fable 5 consult's arithmetic sanity-check flagged the timing as impossible for real ExpertCpu search. Root cause: bug #7 (`BcRecorder` only overrode the stateless `Player` trait methods; the engine always calls the `_with_state` variants, which silently fell through to `ExpertCpuPlayer`'s cheap `AdvancedCpuPlayer`-delegate path). **This run never actually trained against ExpertCpu - its numbers are meaningless for that question, discard them.** Killed once the bug was found. |
-| 10 | **4090, fresh start, `BcRecorder` properly proxying `ExpertCpuPlayer`'s state-aware methods (bug #7 fixed)** | **Current run, in progress.** Verified pre-launch: 200-game val-set generation takes 5.9s (~34 games/s) - real search confirmed running. Trajectory (n=1000 win_rate reads, the reliable ones - n=150 in-loop reads are noisier, see below): Epoch 1: val_acc 65.71%, win_rate **14.20%**. Epoch 2: val_acc 66.92%, win_rate **21.70%** (n=150 in-loop read was 23.33%, ran high). Epoch 3: val_acc 67.42%, win_rate **19.20%** (n=1000; n=150 in-loop read was 21.33%). Fable 5 confirmed the epoch2→3 dip is statistically indistinguishable from noise (z≈1.4) - val_acc rose monotonically all 3 epochs, no overfitting signature. Decision rule set: tripwire through epoch 6, stop-and-move-to-TD-value if still 18-23% there, continue to 15 epochs if any read clearly exceeds 24% first (see "Next steps" below). Epoch 4: val_acc 67.83%, win_rate **23.10%** (n=1000; n=150 in-loop read was 27.33%, overestimated - same pattern as epoch 2's n=150 overshoot). Full n=1000 trajectory now: 14.20% → 21.70% → 19.20% → 23.10% - still consistent with fluctuation around a ~20-23% plateau, not a clear breakout past the 24% tripwire threshold. Epoch 5: val_acc 68.32%, win_rate **23.00%** (n=1000). Epoch 6: val_acc 68.70%, win_rate **22.90%** (n=1000) - the decision checkpoint. **Full 6-epoch win_rate trajectory: 14.20% → 21.70% → 19.20% → 23.10% → 23.00% → 22.90%.** Epochs 3-6 locked in a tight 19.20-23.10% band, never once breaking past 24% - about as clean a plateau confirmation as the data could give. **STOPPED BC HERE (2026-07-10, overnight autonomous run, user pre-authorized).** A second Fable 5 consult, given the complete 6-epoch picture plus the standing tripwire rule, confirmed decisively: "stop now and transition to TD-value... this isn't a borderline call... BC has extracted what it can; the gap to the 25% gate and the 47.5% ExpertCpu ceiling belongs to TD-value." Reasoning: val_acc kept climbing slowly (65.71→68.70%) while win_rate showed zero trend across 4 epochs at n=1000 (SE ~1.3%, so the epoch4-6 spread is pure noise) - the val_acc gains were fitting ExpertCpu's stochastic tail (the measured ~76.5% self-agreement noise floor), not transferring to actual play. Checkpoint safety-copied to `astra7_bc_epoch6_final.bin` before stopping (Fable 5's explicit operational note - confirm flush before pkill). val_acc is far lower than the AdvCPU-teacher run (65-67% vs 92-95%) - expected, ExpertCpu's search-based decisions are a much harder function to imitate (see bugs list - measured directly via a self-consistency test: 53.7% of real decision points show disagreement across 8 repeated queries on the identical state, avg modal agreement only 76.5%, implying a real ~0.3-0.6 nat irreducible cross-entropy floor in the labels themselves, not just "harder but learnable"). A Fable 5 consult (2026-07-10) caught that an apparent policy-loss "plateau" late in epoch 3 was a measurement artifact (cumulative epoch-average is structurally near-flat late in a large epoch) - the fix for this (windowed heartbeat figure) is in the codebase, staged for the next relaunch, not applied retroactively to this run. |
+| 10 | **4090, fresh start, `BcRecorder` properly proxying `ExpertCpuPlayer`'s state-aware methods (bug #7 fixed)** | **Stopped at epoch 6. Checkpoints were only on the pod and are gone** (see "pod lost" above). Verified pre-launch: 200-game val-set generation takes 5.9s (~34 games/s) - real search confirmed running. Trajectory (n=1000 win_rate reads, the reliable ones - n=150 in-loop reads are noisier, see below): Epoch 1: val_acc 65.71%, win_rate **14.20%**. Epoch 2: val_acc 66.92%, win_rate **21.70%** (n=150 in-loop read was 23.33%, ran high). Epoch 3: val_acc 67.42%, win_rate **19.20%** (n=1000; n=150 in-loop read was 21.33%). Fable 5 confirmed the epoch2→3 dip is statistically indistinguishable from noise (z≈1.4) - val_acc rose monotonically all 3 epochs, no overfitting signature. Decision rule set: tripwire through epoch 6, stop-and-move-to-TD-value if still 18-23% there, continue to 15 epochs if any read clearly exceeds 24% first (see "Next steps" below). Epoch 4: val_acc 67.83%, win_rate **23.10%** (n=1000; n=150 in-loop read was 27.33%, overestimated - same pattern as epoch 2's n=150 overshoot). Full n=1000 trajectory now: 14.20% → 21.70% → 19.20% → 23.10% - still consistent with fluctuation around a ~20-23% plateau, not a clear breakout past the 24% tripwire threshold. Epoch 5: val_acc 68.32%, win_rate **23.00%** (n=1000). Epoch 6: val_acc 68.70%, win_rate **22.90%** (n=1000) - the decision checkpoint. **Full 6-epoch win_rate trajectory: 14.20% → 21.70% → 19.20% → 23.10% → 23.00% → 22.90%.** Epochs 3-6 locked in a tight 19.20-23.10% band, never once breaking past 24% - about as clean a plateau confirmation as the data could give. **STOPPED BC HERE (2026-07-10, overnight autonomous run, user pre-authorized).** A second Fable 5 consult, given the complete 6-epoch picture plus the standing tripwire rule, confirmed decisively: "stop now and transition to TD-value... this isn't a borderline call... BC has extracted what it can; the gap to the 25% gate and the 47.5% ExpertCpu ceiling belongs to TD-value." Reasoning: val_acc kept climbing slowly (65.71→68.70%) while win_rate showed zero trend across 4 epochs at n=1000 (SE ~1.3%, so the epoch4-6 spread is pure noise) - the val_acc gains were fitting ExpertCpu's stochastic tail (the measured ~76.5% self-agreement noise floor), not transferring to actual play. Checkpoint safety-copied to `astra7_bc_epoch6_final.bin` before stopping (Fable 5's explicit operational note - confirm flush before pkill). val_acc is far lower than the AdvCPU-teacher run (65-67% vs 92-95%) - expected, ExpertCpu's search-based decisions are a much harder function to imitate (see bugs list - measured directly via a self-consistency test: 53.7% of real decision points show disagreement across 8 repeated queries on the identical state, avg modal agreement only 76.5%, implying a real ~0.3-0.6 nat irreducible cross-entropy floor in the labels themselves, not just "harder but learnable"). A Fable 5 consult (2026-07-10) caught that an apparent policy-loss "plateau" late in epoch 3 was a measurement artifact (cumulative epoch-average is structurally near-flat late in a large epoch) - the fix for this (windowed heartbeat figure) is in the codebase, staged for the next relaunch, not applied retroactively to this run. |
 
 **Harness fairness control** (`az::tests::harness_has_no_seat_bias_between_equally_matched_players`,
 kept as a permanent regression test): seat 0 as AdvCPU vs 3 other AdvCPU
@@ -1064,6 +1316,13 @@ mid-run.**
   (here) so it doesn't get "lost" again.
 
 ## Next steps
+
+**SUPERSEDED 2026-10-04.** The live next measurement is the end of Hestia
+fp32 epoch 2 (validation accuracy against 0.4391, the `diag@epoch` block,
+and the 150-game win rate). TD-value waits on a checkpoint whose greedy
+play places cards and whose win rate has left zero. The July checkpoints
+this section names do not exist anymore. The block below is the record of
+what was launched on the pod.
 
 **RESOLVED (2026-07-10, overnight autonomous run): BC stopped at epoch 6,
 TD-value launched.** The decision rule below (Fable 5 consult) played out

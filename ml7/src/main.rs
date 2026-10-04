@@ -29,10 +29,11 @@ use burn_wgpu::{Wgpu, WgpuDevice};
 #[cfg(all(feature = "tch", feature = "vulkan"))]
 compile_error!("features `tch` and `vulkan` select different training backends; enable only one");
 
-// Arc A380 (Hestia) does FP16 at twice the FP32 rate, and 6GB cannot hold
-// the f32 batch this model wants.
+// fp32 on the Arc. fp16 forced Adam's epsilon to 1e-2, and that floor stalled
+// the policy once per-weight gradients fell below it. Batch 64 is the largest
+// fp32 batch that fits in 6GB; 128 runs out of memory.
 #[cfg(all(not(feature = "tch"), feature = "vulkan"))]
-type Gpu = Wgpu<half::f16, i32>;
+type Gpu = Wgpu<f32, i32>;
 
 #[cfg(all(not(feature = "tch"), feature = "vulkan"))]
 fn vulkan_device() -> WgpuDevice {

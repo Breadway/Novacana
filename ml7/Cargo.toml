@@ -20,11 +20,15 @@ burn-ndarray = { version = "0.21" }
 
 [features]
 default = []
-tch = ["dep:burn-tch"]
+tch = ["dep:burn-tch", "dep:tch"]
 vulkan = ["dep:burn-wgpu"]
 
 [dependencies.burn-tch]
 version = "0.21"
+optional = true
+
+[dependencies.tch]
+version = "0.22"
 optional = true
 
 [dependencies.burn-wgpu]

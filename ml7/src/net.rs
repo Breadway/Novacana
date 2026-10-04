@@ -35,7 +35,7 @@
 
 use burn::{
     grad_clipping::GradientClippingConfig,
-    module::{AutodiffModule, Module},
+    module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig,
         transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
@@ -47,10 +47,9 @@ use burn::{
     },
 };
 
-/// Read floats back as f32. Vulkan training stores f16; callers that score
-/// or log a scalar still want host f32.
-/// Illegal-logit fill. f16 cannot represent 1e9 (it becomes infinity), and
-/// `0 * inf` then turns every legal logit into NaN.
+/// Read floats back as f32. Callers that score or log a scalar want host f32.
+/// Illegal-logit fill. A fill of -1e9 overflows fp16 to infinity, and
+/// `0 * inf` then turns every legal logit into NaN, so the mask stays -1e4.
 pub(crate) const LOGIT_MASK: f32 = -1.0e4;
 
 pub(crate) fn download_f32<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Vec<f32> {
@@ -82,16 +81,17 @@ pub struct Net<B: Backend> {
 
 impl<B: Backend> Net<B> {
     pub fn fresh(device: &B::Device) -> Self {
+        Self::fresh_with_dropout(device, 0.1)
+    }
+
+    pub fn fresh_with_dropout(device: &B::Device, dropout: f64) -> Self {
         let type_embed = EmbeddingConfig::new(TYPE_VOCAB, D_MODEL).init(device);
         let field_embed = (0..NUM_FIELDS)
             .map(|_| EmbeddingConfig::new(FIELD_VOCAB, D_MODEL).init(device))
             .collect();
         let encoder_cfg = TransformerEncoderConfig::new(D_MODEL, D_FF, N_HEADS, N_LAYERS)
             .with_norm_first(true) // ASTRA7.md §3.2: pre-norm
-            .with_dropout(0.1);
-        // f16 flushes 1e-5 to zero, and layer-norm then divides by zero.
-        #[cfg(feature = "vulkan")]
-        let encoder_cfg = encoder_cfg.with_layer_norm_eps(1.0e-4);
+            .with_dropout(dropout);
         let encoder = encoder_cfg.init(device);
         let pointer_hidden = LinearConfig::new(D_MODEL, POINTER_HIDDEN).init(device);
         let pointer_out = LinearConfig::new(POINTER_HIDDEN, 1).init(device);
@@ -278,15 +278,13 @@ pub fn action_valid_mask<B: Backend>(seqs: &[TokenSeq], device: &B::Device) -> T
 // ── Optimizer ──────────────────────────────────────────────────────────────
 
 pub fn make_optimizer<B: AutodiffBackend>() -> impl Optimizer<Net<B>, B> {
-    let config = AdamConfig::new().with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)));
-    // Vulkan trains in f16. Adam's default epsilon (1e-5) flushes to zero
-    // there, and the bias-correction multiplier makes the added term smaller
-    // still, so the first update divides by zero and the weights become NaN.
-    // 1e-2 is the smallest epsilon whose corrected term stays a normal f16
-    // value on step 1.
-    #[cfg(feature = "vulkan")]
-    let config = config.with_epsilon(1.0e-2);
-    config.init()
+    // Default epsilon is 1e-5. The fp16 Vulkan run raised it to 1e-2 because
+    // 1e-5 flushed to zero and the first step produced NaNs. Steady-state
+    // Adam then added that 1e-2 on every update, which stalled the policy
+    // once per-weight gradients fell below it. Vulkan training is fp32.
+    AdamConfig::new()
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+        .init()
 }
 
 // ── BC training step ────────────────────────────────────────────────────
@@ -320,10 +318,31 @@ fn bc_train_step_layout<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
     outcomes: &[f32], label_smoothing: f32, report_metrics: bool,
     layout: BatchLayout, device: &B::Device,
 ) -> (Net<B>, Option<f32>, Option<f32>) {
+    let fwd = bc_forward_layout(&net, seqs, targets, outcomes, label_smoothing,
+        report_metrics, layout, device);
+    // Keep the Fusion queue drain before backward on the one-device path.
+    let pl = fwd.policy_ce.map(|t| download_f32(t).first().copied().unwrap_or(f32::NAN));
+    let vl = fwd.value_mse.map(|t| download_f32(t).first().copied().unwrap_or(f32::NAN));
+    let grads = GradientsParams::from_grads(fwd.total.backward(), &net);
+    (bc_apply_step(net, optim, lr, grads), pl, vl)
+}
+
+struct BcForward<B: AutodiffBackend> {
+    total: Tensor<B, 1>,
+    policy_ce: Option<Tensor<B, 1>>,
+    value_mse: Option<Tensor<B, 1>>,
+    sequences: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bc_forward_layout<B: AutodiffBackend>(
+    net: &Net<B>, seqs: &[TokenSeq], targets: &[u16], outcomes: &[f32],
+    label_smoothing: f32, report_metrics: bool, layout: BatchLayout, device: &B::Device,
+) -> BcForward<B> {
     let b = seqs.len();
     assert!(b > 0);
 
-    let (logits, values) = forward_layout(&net, seqs, layout, device);
+    let (logits, values) = forward_layout(net, seqs, layout, device);
     let valid = action_valid_mask::<B>(seqs, device); // true = legal
     let neg_inf = valid.clone().bool_not().float() * LOGIT_MASK;
     let masked_logits = logits + neg_inf;
@@ -349,25 +368,38 @@ fn bc_train_step_layout<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
     let diff = values - tgt;
     let value_loss = (diff.clone() * diff).mean();
 
-    // Reading a scalar back from CUDA synchronizes the device. Training only
-    // needs these diagnostics at heartbeat intervals, so avoid two device
-    // barriers on every optimizer step.
-    let (pl, vl) = if report_metrics {
-        (
-            Some(download_f32(hard.mean()).first().copied().unwrap_or(f32::NAN)),
-            Some(download_f32(value_loss.clone()).first().copied().unwrap_or(f32::NAN)),
-        )
-    } else {
-        (None, None)
-    };
+    let policy_ce = report_metrics.then(|| hard.mean());
+    let value_mse = report_metrics.then(|| value_loss.clone());
+    // Terminal-outcome BC warm start, with the existing value weight.
+    let total = policy_loss + value_loss * 0.3;
+    BcForward { total, policy_ce, value_mse, sequences: b }
+}
 
-    // ASTRA7.md §10: value target is only a terminal-outcome warm start (the
-    // real value signal comes from TD-value/AZ later) - down-weight so it
-    // doesn't distract the policy gradient, which is what BC is actually for.
-    const VALUE_LOSS_WEIGHT: f32 = 0.3;
-    let total = policy_loss + value_loss * VALUE_LOSS_WEIGHT;
-    let grads = GradientsParams::from_grads(total.backward(), &net);
-    (optim.step(lr, net, grads), pl, vl)
+pub struct BcBackward<B: AutodiffBackend> {
+    pub grads: GradientsParams,
+    pub policy_ce: Option<Tensor<B::InnerBackend, 1>>,
+    pub value_mse: Option<Tensor<B::InnerBackend, 1>>,
+    pub sequences: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bc_backward_layout<B: AutodiffBackend>(
+    net: &Net<B>, seqs: &[TokenSeq], targets: &[u16], outcomes: &[f32],
+    label_smoothing: f32, report_metrics: bool, layout: BatchLayout, device: &B::Device,
+) -> BcBackward<B> {
+    let fwd = bc_forward_layout(net, seqs, targets, outcomes, label_smoothing,
+        report_metrics, layout, device);
+    // Inner handles are eager-backend scalars, never a download or detach.
+    let policy_ce = fwd.policy_ce.map(|t| t.inner());
+    let value_mse = fwd.value_mse.map(|t| t.inner());
+    let grads = GradientsParams::from_grads(fwd.total.backward(), net);
+    BcBackward { grads, policy_ce, value_mse, sequences: fwd.sequences }
+}
+
+pub fn bc_apply_step<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
+    net: Net<B>, optim: &mut O, lr: f64, grads: GradientsParams,
+) -> Net<B> {
+    optim.step(lr, net, grads)
 }
 
 // ── TD-value training step (ASTRA7.md §4.2) ─────────────────────────────

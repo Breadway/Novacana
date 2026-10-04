@@ -81,7 +81,7 @@ Pre-norm, residual, dropout 0.1. Width 256, 8 heads, feed-forward 1024. There is
 1. Layer-norm the residual stream, then multi-head self-attention, dropout, add back.
 2. Layer-norm, then the feed-forward block, dropout, add back.
 
-The feed-forward block is `Linear(256 → 1024) → GELU → dropout 0.1 → Linear(1024 → 256)`. Every linear has a bias. Layer-norm is `γ` and `β` on the last dimension. Its epsilon is `1e-5`, and `1e-4` on the Vulkan fp16 build.
+The feed-forward block is `Linear(256 → 1024) → GELU → dropout 0.1 → Linear(1024 → 256)`. Every linear has a bias. Layer-norm is `γ` and `β` on the last dimension. Its epsilon is `1e-5`.
 
 Attention is bidirectional self-attention. Query, key, and value are the same sequence. Each of Q, K, V, and the output projection is a `256 → 256` linear. The head size is `256 / 8 = 32`, and the scores are divided by `√32` before softmax. A pad key is filled with `−1e4` and then the softmax runs over the key axis. There is no attention mask besides that pad mask, so a state token can attend to action tokens and history. Dropout 0.1 is applied to the scores before the pad fill. The softmax is the ordinary one.
 
@@ -109,6 +109,6 @@ Output shapes: policy logits `[batch, 64]`, value `[batch, 1]` in `(0, 1)`.
 | Value head, 256→256→1 | 66,049 |
 | **Total** | **4,987,394** |
 
-One encoder layer is 4 attention linears (263,168), the feed-forward pair (525,568), and two layer-norms (1,024). A full-precision copy of the weights is 19.0 MiB. The Vulkan trainer stores them in fp16, about 9.5 MiB. The optimizer is Adam with global-norm gradient clipping at 1.0. On the Vulkan build its epsilon is `1e-2`.
+One encoder layer is 4 attention linears (263,168), the feed-forward pair (525,568), and two layer-norms (1,024). A full-precision copy of the weights is 19.0 MiB. The Vulkan trainer stores them in fp32. The optimizer is Adam with global-norm gradient clipping at 1.0 and the default epsilon `1e-5`.
 
 The opponent-hand auxiliary head from `../ASTRA7.md` §3.2 is not in this network.
