@@ -3619,6 +3619,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tch",
 ]
 
 [[package]]

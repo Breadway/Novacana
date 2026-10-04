@@ -336,8 +336,14 @@ struct BcForward<B: AutodiffBackend> {
 
 #[allow(clippy::too_many_arguments)]
 fn bc_forward_layout<B: AutodiffBackend>(
-    net: &Net<B>, seqs: &[TokenSeq], targets: &[u16], outcomes: &[f32],
-    label_smoothing: f32, report_metrics: bool, layout: BatchLayout, device: &B::Device,
+    net: &Net<B>,
+    seqs: &[TokenSeq],
+    targets: &[u16],
+    outcomes: &[f32],
+    label_smoothing: f32,
+    report_metrics: bool,
+    layout: BatchLayout,
+    device: &B::Device,
 ) -> BcForward<B> {
     let b = seqs.len();
     assert!(b > 0);
@@ -349,7 +355,10 @@ fn bc_forward_layout<B: AutodiffBackend>(
     let log_p = activation::log_softmax(masked_logits, 1);
 
     let act_t = Tensor::<B, 2, Int>::from_data(
-        TensorData::new(targets.iter().map(|&a| a as i32).collect::<Vec<_>>(), [b, 1]),
+        TensorData::new(
+            targets.iter().map(|&a| a as i32).collect::<Vec<_>>(),
+            [b, 1],
+        ),
         device,
     );
     let hard = -log_p.clone().gather(1, act_t); // [b, 1]
@@ -372,7 +381,12 @@ fn bc_forward_layout<B: AutodiffBackend>(
     let value_mse = report_metrics.then(|| value_loss.clone());
     // Terminal-outcome BC warm start, with the existing value weight.
     let total = policy_loss + value_loss * 0.3;
-    BcForward { total, policy_ce, value_mse, sequences: b }
+    BcForward {
+        total,
+        policy_ce,
+        value_mse,
+        sequences: b,
+    }
 }
 
 pub struct BcBackward<B: AutodiffBackend> {
@@ -384,22 +398,606 @@ pub struct BcBackward<B: AutodiffBackend> {
 
 #[allow(clippy::too_many_arguments)]
 fn bc_backward_layout<B: AutodiffBackend>(
-    net: &Net<B>, seqs: &[TokenSeq], targets: &[u16], outcomes: &[f32],
-    label_smoothing: f32, report_metrics: bool, layout: BatchLayout, device: &B::Device,
+    net: &Net<B>,
+    seqs: &[TokenSeq],
+    targets: &[u16],
+    outcomes: &[f32],
+    label_smoothing: f32,
+    report_metrics: bool,
+    layout: BatchLayout,
+    device: &B::Device,
 ) -> BcBackward<B> {
-    let fwd = bc_forward_layout(net, seqs, targets, outcomes, label_smoothing,
-        report_metrics, layout, device);
+    let fwd = bc_forward_layout(
+        net,
+        seqs,
+        targets,
+        outcomes,
+        label_smoothing,
+        report_metrics,
+        layout,
+        device,
+    );
     // Inner handles are eager-backend scalars, never a download or detach.
     let policy_ce = fwd.policy_ce.map(|t| t.inner());
     let value_mse = fwd.value_mse.map(|t| t.inner());
     let grads = GradientsParams::from_grads(fwd.total.backward(), net);
-    BcBackward { grads, policy_ce, value_mse, sequences: fwd.sequences }
+    BcBackward {
+        grads,
+        policy_ce,
+        value_mse,
+        sequences: fwd.sequences,
+    }
 }
 
 pub fn bc_apply_step<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
-    net: Net<B>, optim: &mut O, lr: f64, grads: GradientsParams,
+    net: Net<B>,
+    optim: &mut O,
+    lr: f64,
+    grads: GradientsParams,
 ) -> Net<B> {
     optim.step(lr, net, grads)
+}
+
+// BC parameter pairing and reduction. IDs may be equal across replicas;
+// paths, ranks and dimensions define the pairing, with separate grad maps.
+pub const BC_PARAM_TENSORS: usize = 112;
+pub const BC_PARAM_ELEMENTS: usize = 4_987_394;
+
+#[derive(Clone, Debug)]
+pub struct ParamSlot {
+    pub path: String,
+    pub id: ParamId,
+    pub rank: u8,
+    pub numel: usize,
+    pub dims: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairedSlot {
+    pub path: String,
+    pub id0: ParamId,
+    pub id1: ParamId,
+    pub rank: u8,
+    pub dims: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub struct PairError(pub String);
+impl std::fmt::Display for PairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for PairError {}
+
+pub fn float_param_slots<B: Backend>(net: &Net<B>) -> Vec<ParamSlot> {
+    #[derive(Default)]
+    struct Collector {
+        stack: Vec<String>,
+        slots: Vec<ParamSlot>,
+    }
+    impl<B: Backend> ModuleVisitor<B> for Collector {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.stack.push(name.to_owned());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.stack.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let dims = p.val().dims().to_vec();
+            self.slots.push(ParamSlot {
+                path: self.stack.join("."),
+                id: p.id,
+                rank: D as u8,
+                numel: dims.iter().product(),
+                dims,
+            });
+        }
+        // A sentinel slot ensures pairing rejects future non-float params.
+        fn visit_int<const D: usize>(&mut self, p: &Param<Tensor<B, D, Int>>) {
+            self.slots.push(ParamSlot {
+                path: self.stack.join("."),
+                id: p.id,
+                rank: 0,
+                numel: 0,
+                dims: vec![],
+            });
+        }
+        fn visit_bool<const D: usize>(&mut self, p: &Param<Tensor<B, D, Bool>>) {
+            self.slots.push(ParamSlot {
+                path: self.stack.join("."),
+                id: p.id,
+                rank: 0,
+                numel: 0,
+                dims: vec![],
+            });
+        }
+    }
+    let mut c = Collector::default();
+    net.visit(&mut c);
+    c.slots
+}
+
+pub fn pair_slots(a: &[ParamSlot], b: &[ParamSlot]) -> Result<Vec<PairedSlot>, PairError> {
+    let fail = |s: String| PairError(s);
+    if a.len() != b.len() || a.len() != BC_PARAM_TENSORS {
+        return Err(fail(format!(
+            "BC pairing requires {BC_PARAM_TENSORS} slots, found {} and {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut pairs = Vec::with_capacity(a.len());
+    for (a, b) in a.iter().zip(b) {
+        if a.path != b.path {
+            return Err(fail(format!(
+                "BC parameter path mismatch: {} vs {}",
+                a.path, b.path
+            )));
+        }
+        if !seen.insert(&a.path) {
+            return Err(fail(format!("BC duplicate parameter path: {}", a.path)));
+        }
+        if !matches!(a.rank, 1 | 2)
+            || a.rank != b.rank
+            || a.dims != b.dims
+            || a.dims.len() != a.rank as usize
+            || a.numel != a.dims.iter().product::<usize>()
+            || b.numel != a.numel
+        {
+            return Err(fail(format!(
+                "BC rank/dimension mismatch or non-float parameter: {}",
+                a.path
+            )));
+        }
+        pairs.push(PairedSlot {
+            path: a.path.clone(),
+            id0: a.id,
+            id1: b.id,
+            rank: a.rank,
+            dims: a.dims.clone(),
+        });
+    }
+    let elements: usize = a.iter().map(|s| s.numel).sum();
+    if elements != BC_PARAM_ELEMENTS {
+        return Err(fail(format!(
+            "BC pairing requires {BC_PARAM_ELEMENTS} elements, found {elements}"
+        )));
+    }
+    Ok(pairs)
+}
+
+pub fn weighted_average<B: Backend, const D: usize>(
+    grads: &[Tensor<B, D>],
+    counts: &[usize],
+) -> Tensor<B, D> {
+    assert!(!grads.is_empty(), "gradient average must be nonempty");
+    assert_eq!(grads.len(), counts.len(), "gradient/count length mismatch");
+    assert!(
+        counts.iter().all(|&n| n > 0),
+        "sequence counts must be positive"
+    );
+    let total = counts
+        .iter()
+        .try_fold(0usize, |a, n| a.checked_add(*n))
+        .expect("sequence count overflow");
+    let dims = grads[0].dims();
+    let device = grads[0].device();
+    for grad in grads {
+        assert_eq!(grad.dims(), dims, "gradient shape mismatch");
+        assert_eq!(
+            grad.device(),
+            device,
+            "gradients must be on the same device"
+        );
+    }
+    let mut sum = grads[0].clone() * counts[0] as f32;
+    for (g, &n) in grads.iter().zip(counts).skip(1) {
+        sum = sum + g.clone() * n as f32;
+    }
+    sum / total as f32
+}
+
+fn average_slot<B: Backend, const D: usize>(
+    slot: &PairedSlot,
+    a: &mut GradientsParams,
+    b: &mut GradientsParams,
+    counts: [usize; 2],
+    device: &B::Device,
+    output: &mut GradientsParams,
+) -> Result<(), PairError> {
+    let ga = a
+        .remove::<B, D>(slot.id0)
+        .ok_or_else(|| PairError(format!("BC missing device-0 gradient: {}", slot.path)))?;
+    let gb = b
+        .remove::<B, D>(slot.id1)
+        .ok_or_else(|| PairError(format!("BC missing device-1 gradient: {}", slot.path)))?;
+    if ga.dims().as_slice() != slot.dims || gb.dims().as_slice() != slot.dims {
+        return Err(PairError(format!(
+            "BC gradient dimensions changed: {}",
+            slot.path
+        )));
+    }
+    if ga.device() != *device {
+        return Err(PairError(format!(
+            "BC device-0 gradient on wrong device: {}",
+            slot.path
+        )));
+    }
+    let avg = weighted_average(&[ga, gb.to_device(device)], &counts);
+    output.register(slot.id0, avg);
+    Ok(())
+}
+
+pub fn average_gradients<B: Backend>(
+    pairs: &[PairedSlot],
+    mut a: GradientsParams,
+    mut b: GradientsParams,
+    counts: [usize; 2],
+    device: &B::Device,
+) -> Result<GradientsParams, PairError> {
+    let mut output = GradientsParams::new();
+    for slot in pairs {
+        match slot.rank {
+            1 => average_slot::<B, 1>(slot, &mut a, &mut b, counts, device, &mut output)?,
+            2 => average_slot::<B, 2>(slot, &mut a, &mut b, counts, device, &mut output)?,
+            _ => return Err(PairError(format!("BC unsupported rank: {}", slot.path))),
+        }
+    }
+    if !a.is_empty() || !b.is_empty() {
+        return Err(PairError(
+            "BC unexpected gradients outside pairing table".into(),
+        ));
+    }
+    Ok(output)
+}
+
+pub fn check_pair_ids<B: Backend>(
+    net: &Net<B>,
+    replica: &Net<B>,
+    pairs: &[PairedSlot],
+) -> Result<(), PairError> {
+    let current = pair_slots(&float_param_slots(net), &float_param_slots(replica))?;
+    for (now, old) in current.iter().zip(pairs) {
+        if now.path != old.path || now.id0 != old.id0 || now.id1 != old.id1 {
+            return Err(PairError(format!("BC parameter IDs changed: {}", old.path)));
+        }
+    }
+    if current.len() != pairs.len() {
+        return Err(PairError("BC pairing length changed".into()));
+    }
+    Ok(())
+}
+
+/// Copy live weights into the existing replica while preserving its IDs.
+/// Both mapper passes use the same module-path stack as the slot visitor.
+pub fn broadcast_weights<B: AutodiffBackend>(
+    net: &Net<B>,
+    replica: Net<B>,
+    pairs: &[PairedSlot],
+    device: &B::Device,
+) -> Result<Net<B>, PairError> {
+    struct Broadcast<'a, B: AutodiffBackend> {
+        stack: Vec<String>,
+        at: usize,
+        pairs: &'a [PairedSlot],
+        device: &'a B::Device,
+        weights: GradientsParams,
+        source: bool,
+        error: Option<PairError>,
+    }
+    impl<B: AutodiffBackend> ModuleMapper<B> for Broadcast<'_, B> {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.stack.push(name.to_owned());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.stack.pop();
+        }
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let path = self.stack.join(".");
+            let Some(slot) = self.pairs.get(self.at) else {
+                self.error = Some(PairError(format!("BC broadcast unexpected path: {path}")));
+                return param;
+            };
+            self.at += 1;
+            let expected_id = if self.source { slot.id0 } else { slot.id1 };
+            if path != slot.path
+                || param.id != expected_id
+                || D != slot.rank as usize
+                || param.val().dims().as_slice() != slot.dims
+            {
+                self.error = Some(PairError(format!(
+                    "BC broadcast path/id/shape mismatch: {path} vs {}",
+                    slot.path
+                )));
+                return param;
+            }
+            if self.source {
+                let tensor = param.val();
+                let requires_grad = tensor.is_require_grad();
+                let tensor = tensor.to_device(self.device).detach();
+                let tensor = if requires_grad {
+                    tensor.require_grad()
+                } else {
+                    tensor
+                };
+                self.weights.register(slot.id1, tensor);
+                param
+            } else {
+                let Some(tensor) = self.weights.remove::<B, D>(slot.id1) else {
+                    self.error = Some(PairError(format!("BC broadcast missing path: {path}")));
+                    return param;
+                };
+                let (id, _, mapper) = param.consume();
+                Param::from_mapped_value(id, tensor, mapper)
+            }
+        }
+    }
+    check_pair_ids(net, &replica, pairs)?;
+    let mut mapper = Broadcast::<B> {
+        stack: vec![],
+        at: 0,
+        pairs,
+        device,
+        weights: GradientsParams::new(),
+        source: true,
+        error: None,
+    };
+    let _ = net.clone().map(&mut mapper);
+    if let Some(e) = mapper.error.take() {
+        return Err(e);
+    }
+    if mapper.at != pairs.len() {
+        return Err(PairError("BC broadcast missing source slots".into()));
+    }
+    mapper.source = false;
+    mapper.at = 0;
+    let replica = replica.map(&mut mapper);
+    if let Some(e) = mapper.error {
+        return Err(e);
+    }
+    if mapper.at != pairs.len() || !mapper.weights.is_empty() {
+        return Err(PairError("BC broadcast missing replica slots".into()));
+    }
+    Ok(replica)
+}
+
+/// Per-device slots are written only by their worker; the host slot changes
+/// only outside the launch window. No recovery is possible after CUDA OOM.
+#[derive(Default)]
+pub struct BcPhases {
+    cuda0: std::sync::atomic::AtomicU8,
+    cuda1: std::sync::atomic::AtomicU8,
+    host: std::sync::atomic::AtomicU8,
+}
+impl BcPhases {
+    fn store(slot: &std::sync::atomic::AtomicU8, phase: u8) {
+        slot.store(phase, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn install_hook(self: &std::sync::Arc<Self>) {
+        let phases = self.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let load = |slot: &std::sync::atomic::AtomicU8| {
+                slot.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let worker = |n| match n {
+                1 => "forward-backward",
+                2 => "returned",
+                _ => "idle",
+            };
+            let host = match load(&phases.host) {
+                1 => "grad-average",
+                2 => "adam",
+                3 => "broadcast",
+                _ => "idle",
+            };
+            eprintln!("bc: fatal during two-device step, cuda:0 {}, cuda:1 {}, host {host}. No fallback to one GPU and no batch shrink. 256-per-card may OOM a 16 GB T4; rerun with --batch-size 128.", worker(load(&phases.cuda0)), worker(load(&phases.cuda1)));
+            previous(info);
+        }));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bc_backward_pair<B: AutodiffBackend>(
+    net: &Net<B>,
+    replica: &Net<B>,
+    seqs: [&[TokenSeq]; 2],
+    targets: [&[u16]; 2],
+    outcomes: [&[f32]; 2],
+    smoothing: f32,
+    metrics: bool,
+    layouts: [BatchLayout; 2],
+    devices: &[B::Device],
+    phases: &BcPhases,
+) -> [BcBackward<B>; 2] {
+    BcPhases::store(&phases.host, 0);
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            BcPhases::store(&phases.cuda0, 1);
+            let result = bc_backward_layout(
+                net,
+                seqs[0],
+                targets[0],
+                outcomes[0],
+                smoothing,
+                metrics,
+                layouts[0],
+                &devices[0],
+            );
+            BcPhases::store(&phases.cuda0, 2);
+            result
+        });
+        let b = scope.spawn(|| {
+            BcPhases::store(&phases.cuda1, 1);
+            let result = bc_backward_layout(
+                replica,
+                seqs[1],
+                targets[1],
+                outcomes[1],
+                smoothing,
+                metrics,
+                layouts[1],
+                &devices[1],
+            );
+            BcPhases::store(&phases.cuda1, 2);
+            result
+        });
+        // Join both before propagating a worker panic, and before any read/copy.
+        let a = a.join();
+        let b = b.join();
+        let unwrap = |r: std::thread::Result<BcBackward<B>>| match r {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        };
+        [unwrap(a), unwrap(b)]
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bc_two_device_step<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
+    net: Net<B>,
+    replica: Net<B>,
+    pairs: &[PairedSlot],
+    optim: &mut O,
+    lr: f64,
+    seqs: [&[TokenSeq]; 2],
+    targets: [&[u16]; 2],
+    outcomes: [&[f32]; 2],
+    smoothing: f32,
+    metrics: bool,
+    devices: &[B::Device],
+    phases: &BcPhases,
+) -> Result<(Net<B>, Net<B>, Option<f32>, Option<f32>), PairError> {
+    assert_eq!(devices.len(), 2);
+    assert_eq!(seqs[0].len(), seqs[1].len());
+    assert!(seqs[0].len() >= 2);
+    let [a, b] = bc_backward_pair(
+        &net,
+        &replica,
+        seqs,
+        targets,
+        outcomes,
+        smoothing,
+        metrics,
+        [
+            BatchLayout::for_batch(seqs[0]),
+            BatchLayout::for_batch(seqs[1]),
+        ],
+        devices,
+        phases,
+    );
+    BcPhases::store(&phases.host, 1);
+    let counts = [a.sequences, b.sequences];
+    let scalar =
+        |a: Option<Tensor<B::InnerBackend, 1>>, b: Option<Tensor<B::InnerBackend, 1>>| match (a, b)
+        {
+            (Some(a), Some(b)) => {
+                let a = download_f32(a)[0];
+                let b = download_f32(b)[0];
+                Some((counts[0] as f32 * a + counts[1] as f32 * b) / (counts[0] + counts[1]) as f32)
+            }
+            (None, None) => None,
+            _ => panic!("BC inconsistent metric availability"),
+        };
+    let pl = scalar(a.policy_ce, b.policy_ce);
+    let vl = scalar(a.value_mse, b.value_mse);
+    let grads = average_gradients::<B::InnerBackend>(pairs, a.grads, b.grads, counts, &devices[0])?;
+    BcPhases::store(&phases.host, 2);
+    let net = bc_apply_step(net, optim, lr, grads);
+    BcPhases::store(&phases.host, 3);
+    let replica = broadcast_weights(&net, replica, pairs, &devices[1])?;
+    Ok((net, replica, pl, vl))
+}
+
+/// Dense-layout, dropout-free gradient parity on three fork-disjoint graphs.
+/// Does not step Adam, change live weights, or write a checkpoint.
+#[cfg(feature = "tch")]
+pub fn bc_parity<B: AutodiffBackend>(devices: &[B::Device]) -> Result<(), PairError> {
+    assert_eq!(devices.len(), 2);
+    B::seed(&devices[0], 42);
+    let net = Net::<B>::fresh_with_dropout(&devices[0], 0.0);
+    let replica = net.clone().fork(&devices[1]);
+    let reference = net.clone().fork(&devices[0]);
+    let pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&replica))?;
+    let ref_pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&reference))?;
+    let samples = crate::recorder::benchmark_samples(42);
+    assert!(!samples.is_empty());
+    let batch: Vec<_> = samples.iter().cycle().take(4).collect();
+    let seqs: Vec<_> = batch.iter().map(|s| s.tokens).collect();
+    let targets: Vec<_> = batch.iter().map(|s| s.target).collect();
+    let outcomes: Vec<_> = batch.iter().map(|s| s.outcome).collect();
+    let reference_grads = bc_backward_layout(
+        &reference,
+        &seqs,
+        &targets,
+        &outcomes,
+        0.05,
+        false,
+        BatchLayout::dense(),
+        &devices[0],
+    );
+    let [a, b] = bc_backward_pair(
+        &net,
+        &replica,
+        [&seqs[..2], &seqs[2..]],
+        [&targets[..2], &targets[2..]],
+        [&outcomes[..2], &outcomes[2..]],
+        0.05,
+        false,
+        [BatchLayout::dense(); 2],
+        devices,
+        &BcPhases::default(),
+    );
+    let mut avg =
+        average_gradients::<B::InnerBackend>(&pairs, a.grads, b.grads, [2, 2], &devices[0])?;
+    let mut reference = reference_grads.grads;
+    fn compare<B: Backend, const D: usize>(
+        pair: &PairedSlot,
+        reference_pair: &PairedSlot,
+        avg: &mut GradientsParams,
+        reference: &mut GradientsParams,
+    ) -> Result<(f32, f32, f32, f32), PairError> {
+        let g = avg
+            .remove::<B, D>(pair.id0)
+            .ok_or_else(|| PairError(format!("bc-parity missing average: {}", pair.path)))?;
+        let r = reference
+            .remove::<B, D>(reference_pair.id1)
+            .ok_or_else(|| PairError(format!("bc-parity missing reference: {}", pair.path)))?;
+        let diff = g - r.clone();
+        let abs = download_f32(diff.clone().abs().max())[0];
+        let dl2 = download_f32(diff.clone().mul(diff).sum().sqrt())[0];
+        let rl2 = download_f32(r.clone().mul(r).sum().sqrt())[0];
+        Ok((abs, dl2, rl2, dl2 / rl2.max(1e-8)))
+    }
+    let mut worst = (String::new(), 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut worst_score = -1.0f32;
+    let mut failed = false;
+    for (pair, rp) in pairs.iter().zip(&ref_pairs) {
+        let (abs, dl2, rl2, rel) = match pair.rank {
+            1 => compare::<B::InnerBackend, 1>(pair, rp, &mut avg, &mut reference)?,
+            2 => compare::<B::InnerBackend, 2>(pair, rp, &mut avg, &mut reference)?,
+            _ => unreachable!(),
+        };
+        let finite = [abs, dl2, rl2, rel].iter().all(|x| x.is_finite());
+        failed |= !finite || abs > 1e-4 || rel > 1e-4;
+        let score = if finite { abs.max(rel) } else { f32::INFINITY };
+        if score > worst_score {
+            worst_score = score;
+            worst = (pair.path.clone(), abs, dl2, rl2, rel);
+        }
+    }
+    println!("bc-parity: {} ({} tensors), worst={} max_abs={:.6e} diff_l2={:.6e} ref_l2={:.6e} relative_l2={:.6e}",
+        if failed { "FAILED" } else { "passed" }, pairs.len(), worst.0, worst.1, worst.2, worst.3, worst.4);
+    if failed {
+        Err(PairError(format!(
+            "bc-parity tolerance 1e-4 exceeded: {}",
+            worst.0
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 // ── TD-value training step (ASTRA7.md §4.2) ─────────────────────────────
@@ -1155,5 +1753,476 @@ mod diag_tests {
     #[test]
     fn auc_is_absent_when_one_class_is_missing() {
         assert!(roc_auc(&[0.2, 0.8], &[true, true]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bc_parallel_tests {
+    use super::*;
+    use burn::backend::Autodiff;
+    use burn_ndarray::{NdArray, NdArrayDevice};
+
+    fn tensor(v: [f32; 2]) -> Tensor<NdArray, 1> {
+        Tensor::from_data(v, &NdArrayDevice::Cpu)
+    }
+    fn close(t: Tensor<NdArray, 1>, expected: [f32; 2]) {
+        let actual = download_f32(t);
+        for (a, b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn weighted_means_cover_equal_and_unequal_sequence_counts() {
+        close(
+            weighted_average(&[tensor([2., 4.]), tensor([6., 8.])], &[1, 1]),
+            [4., 6.],
+        );
+        close(
+            weighted_average(&[tensor([2., 4.]), tensor([6., 8.])], &[1, 3]),
+            [5., 7.],
+        );
+    }
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn weighted_mean_rejects_length_mismatch() {
+        weighted_average(&[tensor([2., 4.]), tensor([6., 8.])], &[1]);
+    }
+    #[test]
+    #[should_panic(expected = "positive")]
+    fn weighted_mean_rejects_zero_count() {
+        weighted_average(&[tensor([2., 4.]), tensor([6., 8.])], &[0, 1]);
+    }
+    #[test]
+    #[should_panic(expected = "nonempty")]
+    fn weighted_mean_rejects_empty_input() {
+        weighted_average::<NdArray, 1>(&[], &[]);
+    }
+    #[test]
+    #[should_panic(expected = "shape mismatch")]
+    fn weighted_mean_rejects_shape_mismatch() {
+        weighted_average(
+            &[
+                tensor([2., 4.]),
+                Tensor::<NdArray, 1>::zeros([3], &NdArrayDevice::Cpu),
+            ],
+            &[1, 1],
+        );
+    }
+
+    #[test]
+    fn full_model_paths_shapes_and_ids_pair_without_id_deduplication() {
+        type B = Autodiff<NdArray>;
+        let d = NdArrayDevice::Cpu;
+        let net = Net::<B>::fresh(&d);
+        let a = float_param_slots(&net);
+        assert_eq!(a.len(), BC_PARAM_TENSORS);
+        assert_eq!(a.iter().map(|s| s.numel).sum::<usize>(), BC_PARAM_ELEMENTS);
+        assert_eq!(
+            a.iter()
+                .map(|s| &s.path)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            BC_PARAM_TENSORS
+        );
+        assert!(a.iter().all(|s| matches!(s.rank, 1 | 2)));
+        for path in [
+            "field_embed.0.weight",
+            "encoder.layers.0.mha.query.weight",
+            "encoder.layers.0.norm_1.gamma",
+            "pointer_out.bias",
+            "value_out.weight",
+        ] {
+            assert!(a.iter().any(|s| s.path == path), "missing {path}");
+        }
+        let fresh = float_param_slots(&Net::<B>::fresh(&d));
+        assert!(pair_slots(&a, &fresh)
+            .unwrap()
+            .iter()
+            .all(|s| s.id0 != s.id1));
+        let fork = net.clone().fork(&d);
+        let b = float_param_slots(&fork);
+        assert!(pair_slots(&a, &b).unwrap().iter().all(|s| s.id0 == s.id1));
+        check_pair_ids(&net, &fork, &pair_slots(&a, &b).unwrap()).unwrap();
+    }
+
+    fn synthetic_slots() -> Vec<ParamSlot> {
+        (0..BC_PARAM_TENSORS)
+            .map(|i| {
+                let n = if i == 0 {
+                    BC_PARAM_ELEMENTS - (BC_PARAM_TENSORS - 1)
+                } else {
+                    1
+                };
+                ParamSlot {
+                    path: format!("test.{i}"),
+                    id: ParamId::new(),
+                    rank: 1,
+                    numel: n,
+                    dims: vec![n],
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn pairing_rejects_paths_tail_dimensions_and_non_float_slots() {
+        let a = synthetic_slots();
+        pair_slots(&a, &a).unwrap();
+        let mut b = a.clone();
+        b.swap(0, 1);
+        assert!(pair_slots(&a, &b).unwrap_err().0.contains("path mismatch"));
+        assert!(pair_slots(&a, &a[..a.len() - 1]).is_err());
+        let mut b = a.clone();
+        b[0].dims[0] += 1;
+        assert!(pair_slots(&a, &b).unwrap_err().0.contains("dimension"));
+        let mut b = a.clone();
+        b[0].rank = 0;
+        assert!(pair_slots(&b, &b).is_err());
+        let mut b = a.clone();
+        b[1].path = b[0].path.clone();
+        assert!(pair_slots(&b, &b).unwrap_err().0.contains("duplicate"));
+        let mut b = a.clone();
+        b[0].numel += 1;
+        b[0].dims[0] += 1;
+        assert!(pair_slots(&b, &b).unwrap_err().0.contains("elements"));
+    }
+
+    #[test]
+    fn same_id_in_separate_containers_is_averaged_but_one_map_replaces() {
+        let id = ParamId::new();
+        let slot = PairedSlot {
+            path: "test.bias".into(),
+            id0: id,
+            id1: id,
+            rank: 1,
+            dims: vec![2],
+        };
+        let mut a = GradientsParams::new();
+        let mut b = GradientsParams::new();
+        a.register(id, tensor([2., 4.]));
+        b.register(id, tensor([6., 8.]));
+        let avg = average_gradients::<NdArray>(&[slot], a, b, [1, 3], &NdArrayDevice::Cpu).unwrap();
+        assert_eq!(avg.len(), 1);
+        close(avg.get(id).unwrap(), [5., 7.]);
+        let mut single = GradientsParams::new();
+        single.register(id, tensor([2., 4.]));
+        single.register(id, tensor([6., 8.]));
+        assert_eq!(single.len(), 1);
+        close(single.get(id).unwrap(), [6., 8.]);
+    }
+
+    #[test]
+    fn missing_gradient_is_an_error_with_its_module_path() {
+        for missing_device in [0, 1] {
+            let id = ParamId::new();
+            let slot = PairedSlot {
+                path: "test.bias".into(),
+                id0: id,
+                id1: id,
+                rank: 1,
+                dims: vec![2],
+            };
+            let mut a = GradientsParams::new();
+            let mut b = GradientsParams::new();
+            if missing_device != 0 {
+                a.register(id, tensor([2., 4.]));
+            }
+            if missing_device != 1 {
+                b.register(id, tensor([6., 8.]));
+            }
+            let e = average_gradients::<NdArray>(&[slot], a, b, [1, 1], &NdArrayDevice::Cpu)
+                .unwrap_err();
+            assert!(e.0.contains("test.bias"));
+            assert!(e.0.contains(&format!("device-{missing_device}")));
+        }
+    }
+
+    #[test]
+    fn rank_two_gradients_use_their_declared_rank() {
+        let id0 = ParamId::new();
+        let id1 = ParamId::new();
+        let slot = PairedSlot {
+            path: "test.weight".into(),
+            id0,
+            id1,
+            rank: 2,
+            dims: vec![1, 2],
+        };
+        let mut a = GradientsParams::new();
+        let mut b = GradientsParams::new();
+        a.register(id0, tensor([2., 4.]).reshape([1, 2]));
+        b.register(id1, tensor([6., 8.]).reshape([1, 2]));
+        let avg = average_gradients::<NdArray>(&[slot], a, b, [1, 3], &NdArrayDevice::Cpu).unwrap();
+        close(avg.get::<NdArray, 2>(id0).unwrap().reshape([2]), [5., 7.]);
+    }
+
+    #[test]
+    fn broadcast_preserves_ids_weights_and_trainability_across_steps() {
+        type B = Autodiff<NdArray>;
+        let d = NdArrayDevice::Cpu;
+        let mut net = Net::<B>::fresh_with_dropout(&d, 0.0);
+        let mut replica = net.clone().fork(&d);
+        let pairs = pair_slots(&float_param_slots(&net), &float_param_slots(&replica)).unwrap();
+        let mut opt = make_optimizer::<B>();
+        use crate::tokens::{Token, SEQ_LEN};
+        let mut seq = [Token {
+            ttype: 0,
+            fields: [0; NUM_FIELDS],
+        }; SEQ_LEN];
+        seq[0] = Token {
+            ttype: 1,
+            fields: [1; NUM_FIELDS],
+        };
+        seq[STATE_MAX + HISTORY_MAX] = Token {
+            ttype: 7,
+            fields: [2; NUM_FIELDS],
+        };
+        seq[STATE_MAX + HISTORY_MAX + 1] = Token {
+            ttype: 7,
+            fields: [3; NUM_FIELDS],
+        };
+        let seqs = [seq; 2];
+        for metrics in [true, false] {
+            let old = download_f32(net.pointer_out.weight.val().inner());
+            let (nn, rr, pl, vl) = bc_two_device_step(
+                net,
+                replica,
+                &pairs,
+                &mut opt,
+                3e-4,
+                [&seqs, &seqs],
+                [&[0, 1], &[1, 0]],
+                [&[0., 1.], &[1., 0.]],
+                0.05,
+                metrics,
+                &[d.clone(), d.clone()],
+                &BcPhases::default(),
+            )
+            .unwrap();
+            net = nn;
+            replica = rr;
+            check_pair_ids(&net, &replica, &pairs).unwrap();
+            assert_eq!(pl.is_some(), metrics);
+            assert_eq!(vl.is_some(), metrics);
+            if let Some(pl) = pl {
+                assert!(pl.is_finite());
+            }
+            if let Some(vl) = vl {
+                assert!(vl.is_finite());
+            }
+            assert!(net.pointer_out.weight.val().is_require_grad());
+            assert!(replica.pointer_out.weight.val().is_require_grad());
+            let now = download_f32(net.pointer_out.weight.val().inner());
+            assert!(
+                old.iter().zip(&now).any(|(a, b)| a != b),
+                "Adam must update a live weight"
+            );
+            assert_eq!(now, download_f32(replica.pointer_out.weight.val().inner()));
+            assert_eq!(
+                download_f32(net.type_embed.weight.val().inner()),
+                download_f32(replica.type_embed.weight.val().inner())
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "tch"))]
+mod cuda_bc_parity_tests {
+    use super::*;
+    #[test]
+    fn two_cuda_devices_match_global_batch_gradients() {
+        if tch::Cuda::device_count() < 2 {
+            return;
+        }
+        bc_parity::<burn::backend::Autodiff<burn_tch::LibTorch<f32>>>(&[
+            burn_tch::LibTorchDevice::Cuda(0),
+            burn_tch::LibTorchDevice::Cuda(1),
+        ])
+        .unwrap();
+    }
+}
+
+
+#[cfg(all(test, feature = "vulkan", not(feature = "tch")))]
+mod vulkan_bc_regression {
+    use super::*;
+    use burn::backend::Autodiff;
+    use burn::record::{BinFileRecorder, FullPrecisionSettings};
+    use burn_wgpu::Wgpu;
+    fn old_bc_step<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
+        net: Net<B>,
+        optim: &mut O,
+        lr: f64,
+        seqs: &[TokenSeq],
+        targets: &[u16],
+        outcomes: &[f32],
+        label_smoothing: f32,
+        report_metrics: bool,
+        layout: BatchLayout,
+        device: &B::Device,
+    ) -> (Net<B>, Option<f32>, Option<f32>) {
+        let b = seqs.len();
+        assert!(b > 0);
+
+        let (logits, values) = forward_layout(&net, seqs, layout, device);
+        let valid = action_valid_mask::<B>(seqs, device); // true = legal
+        let neg_inf = valid.clone().bool_not().float() * LOGIT_MASK;
+        let masked_logits = logits + neg_inf;
+        let log_p = activation::log_softmax(masked_logits, 1);
+
+        let act_t = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(
+                targets.iter().map(|&a| a as i32).collect::<Vec<_>>(),
+                [b, 1],
+            ),
+            device,
+        );
+        let hard = -log_p.clone().gather(1, act_t); // [b, 1]
+
+        let policy_loss = if label_smoothing > 0.0 {
+            let legal_f = valid.float(); // [b, ACTION_MAX]
+            let num_legal = legal_f.clone().sum_dim(1); // [b, 1]
+            let uniform = -(log_p * legal_f).sum_dim(1) / num_legal; // [b, 1]
+            let eps = label_smoothing;
+            (hard.clone() * (1.0 - eps) + uniform * eps).mean()
+        } else {
+            hard.clone().mean()
+        };
+
+        let tgt = Tensor::<B, 2>::from_data(TensorData::new(outcomes.to_vec(), [b, 1]), device);
+        let diff = values - tgt;
+        let value_loss = (diff.clone() * diff).mean();
+
+        // Reading a scalar back from CUDA synchronizes the device. Training only
+        // needs these diagnostics at heartbeat intervals, so avoid two device
+        // barriers on every optimizer step.
+        let (pl, vl) = if report_metrics {
+            (
+                Some(
+                    download_f32(hard.mean())
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::NAN),
+                ),
+                Some(
+                    download_f32(value_loss.clone())
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::NAN),
+                ),
+            )
+        } else {
+            (None, None)
+        };
+
+        // ASTRA7.md §10: value target is only a terminal-outcome warm start (the
+        // real value signal comes from TD-value/AZ later) - down-weight so it
+        // doesn't distract the policy gradient, which is what BC is actually for.
+        const VALUE_LOSS_WEIGHT: f32 = 0.3;
+        let total = policy_loss + value_loss * VALUE_LOSS_WEIGHT;
+        let grads = GradientsParams::from_grads(total.backward(), &net);
+        (optim.step(lr, net, grads), pl, vl)
+    }
+
+    struct TestFiles(std::path::PathBuf);
+    impl Drop for TestFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn heartbeat_wrapper_matches_original_weights_metrics_and_checkpoint_bytes() {
+        type B = Autodiff<Wgpu<f32, i32>>;
+        let device = crate::vulkan_device();
+        B::seed(&device, 42);
+        let mut initial = Net::<B>::fresh_with_dropout(&device, 0.0);
+        initial.encoder = TransformerEncoderConfig::new(D_MODEL, 128, N_HEADS, 2)
+            .with_dropout(0.0)
+            .with_norm_first(true)
+            .init(&device);
+        // Reload twice to ensure distinct GPU storage even on the same device.
+        // A same-device fork detaches graphs but may still share weight storage.
+        let root = std::env::temp_dir().join(format!("novacana-vulkan-bc-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _files = TestFiles(root.clone());
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        initial
+            .clone()
+            .save_file(root.join("initial"), &recorder)
+            .unwrap();
+        let mut current = initial
+            .clone()
+            .load_file(root.join("initial"), &recorder, &device)
+            .unwrap()
+            .fork(&device);
+        let mut previous = initial
+            .load_file(root.join("initial"), &recorder, &device)
+            .unwrap()
+            .fork(&device);
+        let mut new_opt = make_optimizer::<B>();
+        let mut old_opt = make_optimizer::<B>();
+        use crate::tokens::{Token, SEQ_LEN};
+        let mut seq = [Token {
+            ttype: 0,
+            fields: [0; NUM_FIELDS],
+        }; SEQ_LEN];
+        seq[0] = Token {
+            ttype: 1,
+            fields: [1; NUM_FIELDS],
+        };
+        seq[STATE_MAX + HISTORY_MAX] = Token {
+            ttype: 7,
+            fields: [2; NUM_FIELDS],
+        };
+        seq[STATE_MAX + HISTORY_MAX + 1] = Token {
+            ttype: 7,
+            fields: [3; NUM_FIELDS],
+        };
+        let seqs = [seq; 2];
+        for metrics in [true, false, true] {
+            let (nn, np, nv) = bc_train_step(
+                current,
+                &mut new_opt,
+                3e-4,
+                &seqs,
+                &[0, 1],
+                &[0., 1.],
+                0.05,
+                metrics,
+                &device,
+            );
+            let (oo, op, ov) = old_bc_step(
+                previous,
+                &mut old_opt,
+                3e-4,
+                &seqs,
+                &[0, 1],
+                &[0., 1.],
+                0.05,
+                metrics,
+                BatchLayout::for_batch(&seqs),
+                &device,
+            );
+            current = nn;
+            previous = oo;
+            assert_eq!(np, op, "policy metric differs, report_metrics={metrics}");
+            assert_eq!(nv, ov, "value metric differs, report_metrics={metrics}");
+            current
+                .clone()
+                .save_file(root.join("new"), &recorder)
+                .unwrap();
+            previous
+                .clone()
+                .save_file(root.join("old"), &recorder)
+                .unwrap();
+            let a = std::fs::read(root.join("new.bin")).unwrap();
+            let b = std::fs::read(root.join("old.bin")).unwrap();
+            assert_eq!(a.len(), b.len());
+            assert!(
+                a == b,
+                "single-device checkpoint bytes differ, metrics={metrics}"
+            );
+        }
     }
 }

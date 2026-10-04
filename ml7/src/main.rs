@@ -69,6 +69,77 @@ fn length_grouped(mut idx: Vec<usize>, batch_size: usize, span: impl Fn(usize) -
     batches
 }
 
+/// Visible CUDA is supplied only for an explicit two-device request.
+fn resolve_bc_devices(requested: usize, visible_cuda: Option<usize>) -> Result<usize, String> {
+    match requested {
+        1 => Ok(1),
+        2 => match visible_cuda {
+            Some(n) if n >= 2 => Ok(2),
+            Some(n) => Err(format!(
+                "--devices 2 requires two CUDA devices, found {n}. Refusing to train on one GPU."
+            )),
+            None => {
+                Err("--devices 2 requires the tch feature. Refusing to train on one GPU.".into())
+            }
+        },
+        _ => Err("--devices accepts only 1 or 2".into()),
+    }
+}
+
+struct BcBatches {
+    steps: Vec<Vec<Vec<usize>>>,
+    dropped_tail: usize,
+    global_batch: usize,
+}
+
+fn bc_batches(
+    idx: Vec<usize>,
+    batch_size: usize,
+    devices: usize,
+    span: impl Fn(usize) -> usize,
+    rng: &mut impl rand::Rng,
+) -> BcBatches {
+    assert!(batch_size > 0);
+    assert!(matches!(devices, 1 | 2));
+    let global_batch = batch_size
+        .checked_mul(devices)
+        .expect("BC global batch overflow");
+    if devices == 1 {
+        let n = idx.len();
+        let batches = length_grouped(idx, batch_size, span, rng);
+        let kept: usize = batches.iter().map(Vec::len).sum();
+        return BcBatches {
+            steps: batches.into_iter().map(|b| vec![b]).collect(),
+            dropped_tail: n - kept,
+            global_batch,
+        };
+    }
+    assert!(batch_size >= 2);
+    let mut idx = idx;
+    idx.sort_unstable_by_key(|i| span(*i));
+    let dropped_tail = idx.len() % global_batch;
+    let mut windows: Vec<_> = idx
+        .chunks_exact(global_batch)
+        .map(|window| {
+            vec![
+                window.iter().step_by(2).copied().collect(),
+                window.iter().skip(1).step_by(2).copied().collect(),
+            ]
+        })
+        .collect();
+    windows.shuffle(rng);
+    BcBatches {
+        steps: windows,
+        dropped_tail,
+        global_batch,
+    }
+}
+
+fn bc_fatal(error: impl std::fmt::Display) -> ! {
+    eprintln!("bc: {error}");
+    std::process::exit(1)
+}
+
 fn flag_usize(args: &[String], flag: &str, default: usize) -> usize {
     args.windows(2).find(|w| w[0] == flag).and_then(|w| w[1].parse().ok()).unwrap_or(default)
 }
@@ -278,7 +349,12 @@ fn main() {
         return;
     }
 
+    if has_flag(&args, "bc-parity") {
+        cmd_bc_parity(&args);
+        return;
+    }
     if has_flag(&args, "bc") {
+        if has_flag(&args, "--help") || has_flag(&args, "-h") { print_bc_help(); return; }
         cmd_bc(&args);
         return;
     }
@@ -314,6 +390,7 @@ fn main() {
     println!("Usage:");
     println!("  novacana-ml7 bench [--batch-size 2] [--steps 3] [--rounds 3] [--layout compact]");
     println!("  novacana-ml7 bc [options]");
+    println!("  novacana-ml7 bc-parity [--help]");
     println!("  novacana-ml7 fidelity --model <path> [options]");
     println!("  novacana-ml7 winrate --model <path> [options]");
     println!("  novacana-ml7 behavior --model <path> [options]");
@@ -322,20 +399,7 @@ fn main() {
     println!("  novacana-ml7 value-rank --model <path> [options]");
     println!("  novacana-ml7 az --model <path> [options]");
     println!();
-    println!("BC (behavior cloning) options:");
-    println!("  --out <path>          [models/astra7_bc.bin]");
-    println!("  --model <path>        warm-start weights");
-    println!("  --games <n>           pregenerate this many games upfront, reuse across epochs [0]");
-    println!("  --chunk-games <n>     stream this many fresh games per epoch instead [2000]");
-    println!("  --players <n>         [4]");
-    println!("  --lr <f>              [0.0003]");
-    println!("  --epochs <n>          [15]");
-    println!("  --batch-size <n>      [64]");
-    println!("  --label-smoothing <f> [0.05]");
-    println!("  --val-games <n>       held-out games for best-checkpoint selection [200]");
-    println!("  --winrate-every <n>   epochs between win-rate gate checks, 0=off [1]");
-    println!("  --winrate-games <n>   games per win-rate check [150]");
-    println!("  --gen-concurrency <n> concurrent self-play/eval workers [2x cores, min 8]");
+    print_bc_help();
     println!();
     println!("Fidelity options (per-ActionKind accuracy breakdown, ASTRA7.md §1.1/§10):");
     println!("  --model <path>        checkpoint to evaluate [models/astra7_bc_best.bin]");
@@ -416,11 +480,31 @@ fn run_bc<B: AutodiffBackend>(
     winrate_games: usize,
     checkpoint_every: usize,
     concurrency: usize,
-    device: &B::Device,
+    devices: &[B::Device],
 ) where
     B::Device: Clone + Sync,
 {
+    let device = &devices[0];
+    let global_batch = batch_size
+        .checked_mul(devices.len())
+        .unwrap_or_else(|| bc_fatal("global batch overflow"));
+    if devices.len() == 1 {
+        println!("bc devices=1 per_device_batch={batch_size} global_batch={global_batch} device={device:?}");
+    } else {
+        println!("bc devices=2 per_device_batch={batch_size} global_batch={global_batch} devices={:?},{:?}", devices[0], devices[1]);
+        println!("bc lr={lr:.6} not scaled (3e-4 was tuned at global batch 64 on the Arc; this run's global batch is {global_batch})");
+    }
+    let phases = std::sync::Arc::new(net::BcPhases::default());
+    if devices.len() == 2 {
+        phases.install_hook();
+    }
     let mut net = initial.unwrap_or_else(|| Net::fresh(device));
+    let mut replica = (devices.len() == 2).then(|| net.clone().fork(&devices[1]));
+    let pairs = replica.as_ref().map(|r| {
+        net::pair_slots(&net::float_param_slots(&net), &net::float_param_slots(r))
+            .unwrap_or_else(|e| bc_fatal(e))
+    });
+    let mut broadcasts = 0usize;
     let mut opt = net::make_optimizer::<B>();
     let mut rng = thread_rng();
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
@@ -464,7 +548,7 @@ fn run_bc<B: AutodiffBackend>(
     };
     let games_per_epoch_est = if chunk_games == 0 { num_games } else { chunk_games };
     let steps_per_epoch_est =
-        ((games_per_epoch_est as f32 * samples_per_game_est) / batch_size as f32).ceil().max(1.0) as usize;
+        ((games_per_epoch_est as f32 * samples_per_game_est) / global_batch as f32).ceil().max(1.0) as usize;
     let total_steps_est = (steps_per_epoch_est * epochs).max(1);
     let warmup_steps = (total_steps_est / 20).max(50);
     let mut global_step: usize = resume.as_ref().map(|r| r.global_step).unwrap_or(0);
@@ -497,8 +581,24 @@ fn run_bc<B: AutodiffBackend>(
         }
 
         let idx: Vec<usize> = (0..samples.len()).collect();
-        let batches = length_grouped(idx, batch_size, |i| net::sequence_span(&samples[i].tokens), &mut rng);
-
+        let cut = bc_batches(
+            idx,
+            batch_size,
+            devices.len(),
+            |i| net::sequence_span(&samples[i].tokens),
+            &mut rng,
+        );
+        if devices.len() == 2 {
+            println!(
+                "bc epoch {}: sequences={} adam_steps={} dropped_tail={} global_batch={}",
+                epoch + 1,
+                samples.len(),
+                cut.steps.len(),
+                cut.dropped_tail,
+                cut.global_batch
+            );
+        }
+        let batches = cut.steps;
         // Progress heartbeat: per-epoch logging alone is blind at this scale
         // (a 300-game epoch can be thousands of batches) - print elapsed
         // time + batch index every HEARTBEAT_EVERY batches so a stalled vs.
@@ -510,12 +610,18 @@ fn run_bc<B: AutodiffBackend>(
         let (mut last_pl, mut last_vl) = (0.0f32, 0.0f32);
         let t0 = Instant::now();
         for chunk in &batches {
-            if chunk.len() < 2 {
-                continue;
-            }
-            let seqs: Vec<TokenSeq> = chunk.iter().map(|&i| samples[i].tokens).collect();
-            let targets: Vec<u16> = chunk.iter().map(|&i| samples[i].target).collect();
-            let outcomes: Vec<f32> = chunk.iter().map(|&i| samples[i].outcome).collect();
+            let seqs: Vec<Vec<TokenSeq>> = chunk
+                .iter()
+                .map(|c| c.iter().map(|&i| samples[i].tokens).collect())
+                .collect();
+            let targets: Vec<Vec<u16>> = chunk
+                .iter()
+                .map(|c| c.iter().map(|&i| samples[i].target).collect())
+                .collect();
+            let outcomes: Vec<Vec<f32>> = chunk
+                .iter()
+                .map(|c| c.iter().map(|&i| samples[i].outcome).collect())
+                .collect();
             let lr_mult = if global_step < warmup_steps {
                 (global_step + 1) as f32 / warmup_steps as f32
             } else {
@@ -526,10 +632,47 @@ fn run_bc<B: AutodiffBackend>(
             };
             let cur_lr = (lr * lr_mult) as f64;
             let report_metrics = (nb + 1) % HEARTBEAT_EVERY == 0 || nb + 1 == total_batches;
-            let (nn, pl, vl) = net::bc_train_step(
-                net, &mut opt, cur_lr, &seqs, &targets, &outcomes, label_smoothing, report_metrics, device,
-            );
-            net = nn;
+            let (pl, vl) = if devices.len() == 1 {
+                let (nn, pl, vl) = net::bc_train_step(
+                    net,
+                    &mut opt,
+                    cur_lr,
+                    &seqs[0],
+                    &targets[0],
+                    &outcomes[0],
+                    label_smoothing,
+                    report_metrics,
+                    device,
+                );
+                net = nn;
+                (pl, vl)
+            } else {
+                assert_eq!(seqs[0].len(), batch_size);
+                assert_eq!(seqs[1].len(), batch_size);
+                let (nn, rr, pl, vl) = net::bc_two_device_step(
+                    net,
+                    replica.take().unwrap(),
+                    pairs.as_ref().unwrap(),
+                    &mut opt,
+                    cur_lr,
+                    [&seqs[0], &seqs[1]],
+                    [&targets[0], &targets[1]],
+                    [&outcomes[0], &outcomes[1]],
+                    label_smoothing,
+                    report_metrics,
+                    devices,
+                    &phases,
+                )
+                .unwrap_or_else(|e| bc_fatal(e));
+                net = nn;
+                replica = Some(rr);
+                broadcasts += 1;
+                if broadcasts == 1 || cfg!(debug_assertions) {
+                    net::check_pair_ids(&net, replica.as_ref().unwrap(), pairs.as_ref().unwrap())
+                        .unwrap_or_else(|e| bc_fatal(e));
+                }
+                (pl, vl)
+            };
             if let (Some(pl), Some(vl)) = (pl, vl) {
                 tpl += pl as f64;
                 tvl += vl as f64;
@@ -907,6 +1050,76 @@ fn cmd_winrate(args: &[String]) {
     }
 }
 
+fn print_bc_help() {
+    println!(
+        r#"Usage: novacana-ml7 bc [options]
+  --out <path>          [models/astra7_bc.bin]
+  --model <path>        warm-start weights, reset Adam, best_acc and schedule
+  --resume <path>       continue epoch, global_step and best_acc; Adam is rebuilt
+  --games <n>           pregenerate games and reuse across epochs [0]
+  --chunk-games <n>     fresh games per epoch [2000]
+  --players <n>         [4]
+  --lr <f>              [0.0003], never scaled by device count
+  --epochs <n>          [15]
+  --devices <1|2>       opt-in device count [1]; 2 requires tch and two CUDA devices
+  --batch-size <n>      per-device micro-batch [64]; 2 devices require n >= 2
+  --label-smoothing <f> [0.05]
+  --val-games <n>       held-out games [200]
+  --winrate-every <n>   epochs between gate checks, 0=off [1]
+  --winrate-games <n>   games per check [150]
+  --checkpoint-every <n> Adam updates between checkpoints, 0=off [300]
+  --gen-concurrency <n> self-play/eval workers [2x cores, min 8]
+
+Kaggle T4x2 runbook:
+  Build on the notebook: cargo build --release -p novacana-ml7 --features tch
+  Set LIBTORCH and LD_LIBRARY_PATH for the matching CUDA LibTorch build.
+  Do not copy a Hestia Vulkan binary to the notebook.
+  ./target/release/novacana-ml7 bc-parity
+  Exit 0 plus skipped means do not train. Parity must pass on that notebook.
+  First use a short smoke run and confirm both T4s are busy between heartbeats:
+  ./target/release/novacana-ml7 bc --devices 2 --batch-size 128 --chunk-games 1 --epochs 1 --val-games 0 --winrate-every 0 --gen-concurrency 4 --out models/astra7_smoke.bin
+  Only after parity and overlap succeed, start the comfortable run:
+  ./target/release/novacana-ml7 bc --devices 2 --batch-size 128 --out models/astra7_bc.bin --chunk-games 2000 --epochs 15 --gen-concurrency 4
+  Optional after 128 is stable, 256 per card may OOM, never the first run:
+  ./target/release/novacana-ml7 bc --devices 2 --batch-size 256 --out models/astra7_bc.bin --chunk-games 2000 --epochs 15 --gen-concurrency 4
+  LR is not scaled: 3e-4 was tuned at global batch 64 on the Arc;
+  these runs use global batch 256 or 512. Generation concurrency 4 is a runbook choice.
+  Two devices drop the incomplete global-batch tail and stride length-sorted windows.
+  global_step, heartbeat and checkpoints count Adam updates, not micro-batches.
+  Resuming a large one-GPU global_step onto --devices 2 with a larger batch sits
+  further along a shorter cosine horizon. Prefer a fresh start or --model.
+  Watch both cards with nvidia-smi. Cards strictly alternating for whole micro-steps
+  mean a host sync or host-bound launch: stop the run. The fallback is one T4
+  at --devices 1 --batch-size 256. There is no automatic fallback or batch shrink.
+  Validation, win-rate and spectator games use device 0 only."#
+    );
+}
+
+fn cmd_bc_parity(args: &[String]) {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!("Usage: novacana-ml7 bc-parity (requires --features tch). Compare dropout-0 dense gradients on two CUDA devices against one global batch at absolute/relative L2 tolerance 1e-4. No Adam step or checkpoint. Exit 0 plus skipped means do not train. Run this on the notebook before a short overlap check and the T4x2 BC job.");
+        return;
+    }
+    #[cfg(feature = "tch")]
+    {
+        let visible = tch::Cuda::device_count();
+        if visible < 2 {
+            println!("bc-parity: skipped, visible CUDA devices = {visible}");
+            return;
+        }
+        net::bc_parity::<Autodiff<LibTorch<f32>>>(&[
+            LibTorchDevice::Cuda(0),
+            LibTorchDevice::Cuda(1),
+        ])
+        .unwrap_or_else(|e| bc_fatal(e));
+    }
+    #[cfg(not(feature = "tch"))]
+    {
+        eprintln!("bc-parity requires --features tch");
+        std::process::exit(2);
+    }
+}
+
 fn cmd_bc(args: &[String]) {
     let out_path = flag_str(args, "--out", "models/astra7_bc.bin");
     let num_games = flag_usize(args, "--games", 0);
@@ -915,6 +1128,29 @@ fn cmd_bc(args: &[String]) {
     let lr = flag_f32(args, "--lr", 0.0003);
     let epochs = flag_usize(args, "--epochs", 15);
     let batch_size = flag_usize(args, "--batch-size", 64);
+    let requested = if has_flag(args, "--devices") {
+        flag_str(args, "--devices", "")
+            .parse::<usize>()
+            .unwrap_or_else(|_| bc_fatal("--devices accepts only 1 or 2"))
+    } else {
+        1
+    };
+    #[cfg(feature = "tch")]
+    let visible = if requested == 2 {
+        // LibTorch::device_count is hardcoded to 1 in burn-tch 0.21.
+        Some(usize::try_from(tch::Cuda::device_count()).unwrap_or(0))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "tch"))]
+    let visible = None;
+    let device_count = resolve_bc_devices(requested, visible).unwrap_or_else(|e| bc_fatal(e));
+    if batch_size == 0 || (device_count == 2 && batch_size < 2) {
+        bc_fatal("--devices 2 requires --batch-size >= 2; all BC batches must be nonzero");
+    }
+    batch_size
+        .checked_mul(device_count)
+        .unwrap_or_else(|| bc_fatal("global batch overflow"));
     let label_smoothing = flag_f32(args, "--label-smoothing", 0.05);
     let val_games = flag_usize(args, "--val-games", 200);
     // Real win-rate gate (ASTRA7.md §4.1), not just token-accuracy - found
@@ -953,7 +1189,8 @@ fn cmd_bc(args: &[String]) {
     // work without needing Atlas. Mirrors ml/src/main.rs's gpu/not(gpu) split.
     #[cfg(feature = "tch")]
     {
-        let device = LibTorchDevice::Cuda(0);
+        let devices: Vec<_> = (0..device_count).map(LibTorchDevice::Cuda).collect();
+        let device = devices[0];
         type B = Autodiff<LibTorch<f32>>;
 
         let initial: Option<Net<B>> = if !load_path.is_empty() {
@@ -972,7 +1209,7 @@ fn cmd_bc(args: &[String]) {
 
         run_bc::<B>(
             initial, resume_meta, &out_path, num_games, chunk_games, num_players, lr, epochs, batch_size, label_smoothing,
-            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, &device,
+            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, &devices,
         );
         return;
     }
@@ -993,7 +1230,7 @@ fn cmd_bc(args: &[String]) {
         };
         run_bc::<B>(
             initial, resume_meta, &out_path, num_games, chunk_games, num_players, lr, epochs, batch_size, label_smoothing,
-            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, &device,
+            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, std::slice::from_ref(&device),
         );
         return;
     }
@@ -1018,7 +1255,7 @@ fn cmd_bc(args: &[String]) {
 
         run_bc::<B>(
             initial, resume_meta, &out_path, num_games, chunk_games, num_players, lr, epochs, batch_size, label_smoothing,
-            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, &device,
+            val_games, winrate_every, winrate_games, checkpoint_every, concurrency, std::slice::from_ref(&device),
         );
     }
 }
@@ -1613,5 +1850,80 @@ fn cmd_az(args: &[String]) {
             net, &out_path, iters, games_per_iter, num_players, sims, c_puct, dirichlet_eps, advcpu_share,
             expert_share, window, batch_size, lr_start, lr_end, snapshot_every, eval_every, eval_games, concurrency, &device,
         );
+    }
+}
+
+#[cfg(test)]
+mod bc_device_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn device_resolution_is_opt_in_and_fails_closed() {
+        assert_eq!(resolve_bc_devices(1, Some(2)), Ok(1));
+        assert_eq!(resolve_bc_devices(1, None), Ok(1));
+        assert_eq!(resolve_bc_devices(2, Some(2)), Ok(2));
+        assert!(resolve_bc_devices(2, Some(1))
+            .unwrap_err()
+            .contains("found 1. Refusing"));
+        assert!(resolve_bc_devices(2, Some(0))
+            .unwrap_err()
+            .contains("found 0"));
+        assert!(resolve_bc_devices(2, None)
+            .unwrap_err()
+            .contains("requires the tch feature"));
+        for n in [0, 3, usize::MAX] {
+            assert!(resolve_bc_devices(n, Some(2))
+                .unwrap_err()
+                .contains("only 1 or 2"));
+        }
+    }
+
+    #[test]
+    fn single_device_cutter_preserves_partial_batches_and_shuffle() {
+        for n in [0, 1, 5, 7, 8, 11] {
+            let idx: Vec<_> = (0..n).rev().collect();
+            let expected = length_grouped(idx.clone(), 4, |i| i, &mut StdRng::seed_from_u64(42));
+            let cut = bc_batches(idx, 4, 1, |i| i, &mut StdRng::seed_from_u64(42));
+            assert_eq!(
+                cut.steps,
+                expected.iter().map(|c| vec![c.clone()]).collect::<Vec<_>>()
+            );
+            assert_eq!(cut.global_batch, 4);
+            assert_eq!(cut.dropped_tail, usize::from(n % 4 == 1));
+            if n == 7 {
+                assert!(cut.steps.iter().any(|c| c[0].len() == 3));
+            }
+            if n == 5 {
+                assert_eq!(cut.steps.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn two_device_cutter_strides_windows_and_drops_a_full_micro_batch_tail() {
+        for n in [0, 3, 8, 12, 19, 24] {
+            let cut = bc_batches(
+                (0..n).rev().collect(),
+                4,
+                2,
+                |i| i,
+                &mut StdRng::seed_from_u64(42),
+            );
+            assert_eq!(cut.steps.len(), n / 8);
+            assert_eq!(cut.dropped_tail, n % 8);
+            assert_eq!(cut.global_batch, 8);
+            for step in &cut.steps {
+                assert_eq!(step.len(), 2);
+                assert_eq!(step[0].len(), 4);
+                assert_eq!(step[1].len(), 4);
+                for (&even, &odd) in step[0].iter().zip(&step[1]) {
+                    assert_eq!(even + 1, odd);
+                }
+                for w in step[0].windows(2) {
+                    assert_eq!(w[0] + 2, w[1]);
+                }
+            }
+        }
     }
 }
