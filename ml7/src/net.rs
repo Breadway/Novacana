@@ -196,6 +196,13 @@ fn encode_trunk<B: Backend>(
 fn encode_trunk_layout<B: Backend>(
     net: &Net<B>, seqs: &[TokenSeq], layout: BatchLayout, device: &B::Device,
 ) -> (Tensor<B, 3>, Tensor<B, 2, Bool>, BatchLayout) {
+    encode_trunk_layout_impl(net, seqs, layout, device, false)
+}
+
+fn encode_trunk_layout_impl<B: Backend>(
+    net: &Net<B>, seqs: &[TokenSeq], layout: BatchLayout, device: &B::Device,
+    stable_offsets: bool,
+) -> (Tensor<B, 3>, Tensor<B, 2, Bool>, BatchLayout) {
     let batch = build_batch::<B>(seqs, layout, device);
 
     let mut emb = net.type_embed.forward(batch.type_ids);
@@ -203,9 +210,42 @@ fn encode_trunk_layout<B: Backend>(
         emb = emb + embed.forward(batch.fields[f].clone());
     }
 
-    let input = TransformerEncoderInput::new(emb).mask_pad(batch.pad_mask.clone());
-    let enc = net.encoder.forward(input);
+    let enc = if stable_offsets {
+        bc_encoder_forward(&net.encoder, emb, batch.pad_mask.clone())
+    } else {
+        let input = TransformerEncoderInput::new(emb).mask_pad(batch.pad_mask.clone());
+        net.encoder.forward(input)
+    };
     (enc, batch.pad_mask, layout)
+}
+
+/// A key bias adds q*b to every key score for a given query. Regular softmax
+/// cancels that offset exactly, but its fp32 backward can leave a tiny residual.
+/// Encode the cancellation in the graph, retaining an exact zero derivative
+/// to the original parameter. Burn drops attention *scores* before softmax:
+/// with dropout or quiet softmax the bias is meaningful and must be retained.
+fn bc_encoder_forward<B: Backend>(
+    encoder: &TransformerEncoder<B>, mut x: Tensor<B, 3>, mask: Tensor<B, 2, Bool>,
+) -> Tensor<B, 3> {
+    struct Materialize;
+    impl<B: Backend> ModuleVisitor<B> for Materialize {
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let _ = p.val();
+        }
+    }
+    for layer in &encoder.layers {
+        if layer.mha.dropout.prob == 0.0 && !layer.mha.quiet_softmax {
+            // This local view shares nodes only with its own device's source
+            // graph. Initialize before cloning even when called on a fresh net.
+            layer.visit(&mut Materialize);
+            let mut view = layer.clone();
+            view.mha.key.bias = view.mha.key.bias.map(|p| p.map(|t| t * 0.0));
+            x = view.forward(x, Some(mask.clone()), None);
+        } else {
+            x = layer.forward(x, Some(mask.clone()), None);
+        }
+    }
+    x
 }
 
 /// Mean-pool the state-token block of an encoder output, excluding Pad.
@@ -240,8 +280,15 @@ pub fn forward<B: Backend>(net: &Net<B>, seqs: &[TokenSeq], device: &B::Device) 
 }
 
 fn forward_layout<B: Backend>(net: &Net<B>, seqs: &[TokenSeq], layout: BatchLayout, device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    forward_layout_impl(net, seqs, layout, device, false)
+}
+
+fn forward_layout_impl<B: Backend>(
+    net: &Net<B>, seqs: &[TokenSeq], layout: BatchLayout, device: &B::Device,
+    stable_offsets: bool,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
     let b = seqs.len();
-    let (enc, pad_mask, _) = encode_trunk_layout(net, seqs, layout, device);
+    let (enc, pad_mask, _) = encode_trunk_layout_impl(net, seqs, layout, device, stable_offsets);
 
     // ── Value: mean-pool state block, excluding Pad ──────────────────────
     let pooled = pool_state(enc.clone(), pad_mask, layout.state);
@@ -250,7 +297,14 @@ fn forward_layout<B: Backend>(net: &Net<B>, seqs: &[TokenSeq], layout: BatchLayo
     // ── Policy: pointer scores over the action-token block ───────────────
     let action_block = enc.narrow(1, layout.state + layout.history, layout.actions); // [b, ACTION_MAX, D]
     let ph = activation::relu(net.pointer_hidden.forward(action_block));
-    let logits = net.pointer_out.forward(ph).reshape([b, layout.actions]);
+    let logits = if stable_offsets {
+        // This scalar bias shifts every action logit equally. The policy loss
+        // is invariant to it; keep its graph edge so all parameter grads exist.
+        burn::tensor::module::linear(ph, net.pointer_out.weight.val(),
+            net.pointer_out.bias.as_ref().map(|p| p.val() * 0.0))
+    } else {
+        net.pointer_out.forward(ph)
+    }.reshape([b, layout.actions]);
     // Restore the public fixed-width action interface. These slots are always
     // masked by every caller, so computing a pointer head for them is wasted.
     let logits = if layout.actions < ACTION_MAX {
@@ -319,7 +373,7 @@ fn bc_train_step_layout<B: AutodiffBackend, O: Optimizer<Net<B>, B>>(
     layout: BatchLayout, device: &B::Device,
 ) -> (Net<B>, Option<f32>, Option<f32>) {
     let fwd = bc_forward_layout(&net, seqs, targets, outcomes, label_smoothing,
-        report_metrics, layout, device);
+        report_metrics, layout, device, false);
     // Keep the Fusion queue drain before backward on the one-device path.
     let pl = fwd.policy_ce.map(|t| download_f32(t).first().copied().unwrap_or(f32::NAN));
     let vl = fwd.value_mse.map(|t| download_f32(t).first().copied().unwrap_or(f32::NAN));
@@ -344,11 +398,12 @@ fn bc_forward_layout<B: AutodiffBackend>(
     report_metrics: bool,
     layout: BatchLayout,
     device: &B::Device,
+    stable_offsets: bool,
 ) -> BcForward<B> {
     let b = seqs.len();
     assert!(b > 0);
 
-    let (logits, values) = forward_layout(net, seqs, layout, device);
+    let (logits, values) = forward_layout_impl(net, seqs, layout, device, stable_offsets);
     let valid = action_valid_mask::<B>(seqs, device); // true = legal
     let neg_inf = valid.clone().bool_not().float() * LOGIT_MASK;
     let masked_logits = logits + neg_inf;
@@ -416,6 +471,7 @@ fn bc_backward_layout<B: AutodiffBackend>(
         report_metrics,
         layout,
         device,
+        true,
     );
     // Inner handles are eager-backend scalars, never a download or detach.
     let policy_ce = fwd.policy_ce.map(|t| t.inner());
@@ -986,7 +1042,7 @@ pub fn bc_parity<B: AutodiffBackend>(devices: &[B::Device]) -> Result<(), PairEr
     }
     let mut worst = (String::new(), 0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut worst_score = -1.0f32;
-    let mut failed = false;
+    let mut failed = 0;
     for (pair, rp) in pairs.iter().zip(&ref_pairs) {
         let (abs, dl2, rl2, rel) = match pair.rank {
             1 => compare::<B::InnerBackend, 1>(pair, rp, &mut avg, &mut reference)?,
@@ -994,16 +1050,19 @@ pub fn bc_parity<B: AutodiffBackend>(devices: &[B::Device]) -> Result<(), PairEr
             _ => unreachable!(),
         };
         let finite = [abs, dl2, rl2, rel].iter().all(|x| x.is_finite());
-        failed |= !finite || abs > 1e-4 || rel > 1e-4;
+        if !finite || abs > 1e-4 || rel > 1e-4 {
+            failed += 1;
+            println!("bc-parity: tensor={} max_abs={abs:.6e} diff_l2={dl2:.6e} ref_l2={rl2:.6e} relative_l2={rel:.6e}", pair.path);
+        }
         let score = if finite { abs.max(rel) } else { f32::INFINITY };
         if score > worst_score {
             worst_score = score;
             worst = (pair.path.clone(), abs, dl2, rl2, rel);
         }
     }
-    println!("bc-parity: {} ({} tensors), worst={} max_abs={:.6e} diff_l2={:.6e} ref_l2={:.6e} relative_l2={:.6e}",
-        if failed { "FAILED" } else { "passed" }, pairs.len(), worst.0, worst.1, worst.2, worst.3, worst.4);
-    if failed {
+    println!("bc-parity: {} ({} tensors, {} failed), worst={} max_abs={:.6e} diff_l2={:.6e} ref_l2={:.6e} relative_l2={:.6e}",
+        if failed > 0 { "FAILED" } else { "passed" }, pairs.len(), failed, worst.0, worst.1, worst.2, worst.3, worst.4);
+    if failed > 0 {
         Err(PairError(format!(
             "bc-parity tolerance 1e-4 exceeded: {}",
             worst.0
@@ -1845,6 +1904,84 @@ mod bc_parallel_tests {
     #[test]
     fn cpu_split_gradients_match_the_unchanged_dense_parity_check() {
         bc_parity::<Autodiff<NdArray>>(&[NdArrayDevice::Cpu, NdArrayDevice::Cpu]).unwrap();
+    }
+
+    fn offset_fixture() -> Vec<TokenSeq> {
+        use crate::tokens::{Token, SEQ_LEN};
+        [(3, 0, 2), (9, 3, 5)].into_iter().map(|(s, h, a)| {
+            let mut seq = [Token { ttype: 0, fields: [0; NUM_FIELDS] }; SEQ_LEN];
+            for (start, len, kind) in [(0, s, 1), (STATE_MAX, h, 6),
+                (STATE_MAX + HISTORY_MAX, a, 7)] {
+                for i in 0..len {
+                    seq[start + i] = Token { ttype: kind,
+                        fields: [((i + 1) % FIELD_VOCAB) as u8; NUM_FIELDS] };
+                }
+            }
+            seq
+        }).collect()
+    }
+
+    #[test]
+    fn stable_offsets_preserve_loss_and_meaningful_gradients() {
+        type B = Autodiff<NdArray>;
+        let device = NdArrayDevice::Cpu;
+        let net = Net::<B>::fresh_with_dropout(&device, 0.0);
+        let (reference, _) = fork_bc_replica(&net, &device).unwrap();
+        let seqs = offset_fixture();
+        let layout = BatchLayout::for_batch(&seqs);
+        let original = bc_forward_layout(&reference, &seqs, &[1, 2], &[0., 1.],
+            0.05, true, layout, &device, false);
+        let stable = bc_forward_layout(&net, &seqs, &[1, 2], &[0., 1.],
+            0.05, true, layout, &device, true);
+        for (a, b) in [(original.total.clone(), stable.total.clone()),
+            (original.policy_ce.unwrap(), stable.policy_ce.unwrap()),
+            (original.value_mse.unwrap(), stable.value_mse.unwrap())] {
+            let error = download_f32(a.inner() - b.inner())[0].abs();
+            assert!(error < 1e-6, "loss changed by {error:e}");
+        }
+        let mut original_grads = GradientsParams::from_grads(original.total.backward(), &reference);
+        let mut stable_grads = GradientsParams::from_grads(stable.total.backward(), &net);
+        fn compare<const D: usize>(slot: &ParamSlot, a: &mut GradientsParams, b: &mut GradientsParams) {
+            let original = a.remove::<NdArray, D>(slot.id).unwrap();
+            let stable = b.remove::<NdArray, D>(slot.id).unwrap();
+            if slot.path == "pointer_out.bias" || slot.path.ends_with(".mha.key.bias") {
+                assert!(download_f32(stable).iter().all(|&v| v == 0.0),
+                    "{} must have its analytical zero gradient", slot.path);
+            } else {
+                let diff = stable - original.clone();
+                let abs = download_f32(diff.clone().abs().max())[0];
+                let dl2 = download_f32((diff.clone() * diff).sum().sqrt())[0];
+                let rl2 = download_f32((original.clone() * original).sum().sqrt())[0];
+                assert!(abs <= 1e-6 && dl2 / rl2.max(1e-8) <= 1e-4,
+                    "{} changed: abs={abs:e}, relative_l2={:e}", slot.path, dl2 / rl2.max(1e-8));
+            }
+        }
+        for slot in float_param_slots(&net) {
+            match slot.rank {
+                1 => compare::<1>(&slot, &mut original_grads, &mut stable_grads),
+                2 => compare::<2>(&slot, &mut original_grads, &mut stable_grads),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn stable_offsets_retain_key_bias_gradients_with_dropout_or_quiet_softmax() {
+        type B = Autodiff<NdArray>;
+        let device = NdArrayDevice::Cpu;
+        let seqs = offset_fixture();
+        for (dropout, quiet) in [(0.1, false), (0.0, true)] {
+            let mut net = Net::<B>::fresh_with_dropout(&device, dropout);
+            net.encoder = TransformerEncoderConfig::new(D_MODEL, 128, N_HEADS, 1)
+                .with_norm_first(true).with_dropout(dropout).with_quiet_softmax(quiet).init(&device);
+            let mut backward = bc_backward_layout(&net, &seqs, &[1, 2], &[0., 1.],
+                0.05, false, BatchLayout::for_batch(&seqs), &device);
+            let bias = net.encoder.layers[0].mha.key.bias.as_ref().unwrap();
+            let grad = backward.grads.remove::<NdArray, 1>(bias.id).unwrap();
+            let max = download_f32(grad.abs().max())[0];
+            assert!(max.is_finite() && max > 1e-9,
+                "meaningful key bias was removed: dropout={dropout}, quiet={quiet}, grad={max:e}");
+        }
     }
 
     #[test]

@@ -450,7 +450,15 @@ For every paired tensor, let `d = g_avg - g_ref` on device 0. Fail if
 - `max_abs(d) > 1e-4`, or
 - `l2(d) / max(l2(g_ref), 1e-8) > 1e-4`.
 
-Print the worst path, both norms, and the max abs. Exit 1 on failure. Exit 0 on success. Do not loosen `1e-4` to paper over a shared-`NodeRef` reference.
+Print each failing path, the worst path, both norms, and the max abs. The summary distinguishes the number of tensors checked from the number that failed. Exit 1 on failure. Exit 0 on success. Do not loosen `1e-4` to paper over a shared-`NodeRef` reference.
+
+#### Common-offset derivatives
+
+`bc_backward_layout` uses a numerically stable, loss-equivalent forward graph. The scalar `pointer_out.bias` shifts all legal action logits equally, so the policy loss has an analytical zero derivative with respect to it. With dropout disabled and regular softmax, each attention key bias also contributes the same `q * bias` offset to every key score for a query. Its derivative is zero too. Ordinary fp32 softmax backward and bias reductions can leave different cancellation residuals on a concatenated batch and its halves. A residual of `5.96e-8` can therefore fail the strict relative comparison even though its absolute error is tiny.
+
+The stable forward omits these common offsets using tracked `bias * 0` tensors. Backward produces exact zero gradients for the original parameters; all 112 tensors remain present and subject to both unchanged checks. Gradients are never filtered, overwritten, rounded, or thresholded after backward. The layer views share nodes only within their own source device's graph, and their parameters are materialized before cloning. They do not change stored weights or join the replica's graph to the primary graph.
+
+Burn 0.21 applies attention dropout to scores before softmax. A key bias is meaningful with that dropout, and with quiet softmax, so the stable forward retains it in either case. Normal training still uses dropout 0.1. The one-device wrapper and inference keep their existing forward calculations and heartbeat ordering. CPU regressions compare the stable loss and all meaningful gradients with the original calculation, require exact zero common-offset derivatives, retain nonzero key-bias derivatives with dropout or quiet softmax, and run the full strict dense parity check.
 
 Device count. `tch::Cuda::device_count()` returns `i64`. Cast with `usize::try_from` only when a `usize` is required. Compare the `i64` directly for the skip:
 
