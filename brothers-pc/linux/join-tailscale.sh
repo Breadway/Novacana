@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # One-shot Tailscale join for the brother's PC (run inside WSL2/Ubuntu).
 # Replaces the interactive browser-login flow in README Step 5 with a
-# single command using a pre-generated auth key.
+# single command using a short-lived auth key.
 #
-# NOT committed to git (this whole brothers-pc/ folder is untracked, keep
-# it that way while this file has a live key in it). The key below is a
-# REUSABLE key with a ~7-day expiry (set when generated 2026-07-16) - if
-# setup gets redone after it expires, generate a fresh one at
-# https://login.tailscale.com/admin/settings/keys and swap it in below.
-# Revoke it from that same page once the brother's PC has successfully
-# joined and you don't expect to need it again.
+# The key is never stored here. Export TAILSCALE_AUTH_KEY, or pass it as the
+# first argument. Generate a short-lived, single-use key at
+# https://login.tailscale.com/admin/settings/keys and revoke it once the
+# brother's PC has joined.
 
 set -euo pipefail
 
-AUTH_KEY="tskey-auth-kwwqeQjPJ521CNTRL-fE6DWF1xDBWSAHJqCKCmAWh51JQM8LQFc"
+AUTH_KEY="${TAILSCALE_AUTH_KEY:-${1:-}}"
+if [ -z "${AUTH_KEY}" ]; then
+    echo "Set TAILSCALE_AUTH_KEY or pass the auth key as the first argument." >&2
+    exit 1
+fi
 HOSTNAME="brotherspc"
 
 if ! command -v tailscale >/dev/null 2>&1; then
